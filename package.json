@@ -1,28 +1,33 @@
 {
-  "name": "qq-codex-bridge",
-  "version": "0.1.4",
-  "description": "A bridge between QQ Official Bot and Codex Desktop, with media relay, STT, thread management, and incremental reply delivery.",
+  "name": "codex-desktop-orchestrator",
+  "version": "0.0.1",
+  "description": "Orchestrate and command Codex Desktop from QQ and WeChat, with room for Lark and Telegram adapters.",
   "type": "module",
-  "homepage": "https://github.com/983033995/qq-codex-bridge",
+  "homepage": "https://github.com/xxloocee/codex-desktop-orchestrator",
   "bugs": {
-    "url": "https://github.com/983033995/qq-codex-bridge/issues"
+    "url": "https://github.com/xxloocee/codex-desktop-orchestrator/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/983033995/qq-codex-bridge.git"
+    "url": "git+https://github.com/xxloocee/codex-desktop-orchestrator.git"
   },
   "keywords": [
     "bridge",
     "cdp",
     "codex",
+    "codex-desktop",
     "electron",
+    "lark",
+    "orchestrator",
     "qq",
     "qq-bot",
+    "telegram",
+    "weixin",
     "typescript"
   ],
   "bin": {
-    "qq-codex-bridge": "bin/qq-codex-bridge.js",
-    "qq-codex-weixin-gateway": "bin/qq-codex-weixin-gateway.js"
+    "codex-desktop-orchestrator": "bin/codex-desktop-orchestrator.js",
+    "codex-desktop-weixin-gateway": "bin/codex-desktop-weixin-gateway.js"
   },
   "files": [
     "bin",
@@ -46,6 +51,8 @@
     "start:weixin-gateway": "node dist/apps/weixin-gateway/src/cli.js",
     "debug:codex-workers": "tsx apps/bridge-daemon/src/debug-codex-workers.ts",
     "test": "vitest run",
+    "test:offline": "vitest run tests/e2e/qq-offline-smoke.e2e.test.ts",
+    "test:bridge-smoke": "npm run build && node scripts/smoke-bridge.mjs",
     "test:watch": "vitest",
     "check": "tsc -p tsconfig.json --noEmit",
     "prepare-release": "pnpm run build && npm pack --dry-run",

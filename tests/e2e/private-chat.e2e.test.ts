@@ -360,12 +360,12 @@ describe("bootstrap integration", () => {
         {
           draftId: "draft-media-1",
           sessionKey: "weixin:default::wx:c2c:wxid-1",
-          text: "<qqmedia>/Volumes/13759427003/AI/qq-codex-bridge/runtime/demo.jpg</qqmedia>",
+          text: "<qqmedia>/Volumes/13759427003/AI/codex-desktop-orchestrator/runtime/demo.jpg</qqmedia>",
           mediaArtifacts: [
             {
               kind: MediaArtifactKind.Image,
-              sourceUrl: "/Volumes/13759427003/AI/qq-codex-bridge/runtime/demo.jpg",
-              localPath: "/Volumes/13759427003/AI/qq-codex-bridge/runtime/demo.jpg",
+              sourceUrl: "/Volumes/13759427003/AI/codex-desktop-orchestrator/runtime/demo.jpg",
+              localPath: "/Volumes/13759427003/AI/codex-desktop-orchestrator/runtime/demo.jpg",
               mimeType: "image/jpeg",
               fileSize: 2048,
               originalName: "demo.jpg"
@@ -402,7 +402,7 @@ describe("bootstrap integration", () => {
           text: "",
           mediaArtifacts: [
             expect.objectContaining({
-              localPath: "/Volumes/13759427003/AI/qq-codex-bridge/runtime/demo.jpg"
+              localPath: "/Volumes/13759427003/AI/codex-desktop-orchestrator/runtime/demo.jpg"
             })
           ]
         })
@@ -444,8 +444,8 @@ describe("bootstrap integration", () => {
           mediaArtifacts: [
             {
               kind: MediaArtifactKind.Image,
-              sourceUrl: "/Volumes/13759427003/AI/qq-codex-bridge/runtime/demo.jpg",
-              localPath: "/Volumes/13759427003/AI/qq-codex-bridge/runtime/demo.jpg",
+              sourceUrl: "/Volumes/13759427003/AI/codex-desktop-orchestrator/runtime/demo.jpg",
+              localPath: "/Volumes/13759427003/AI/codex-desktop-orchestrator/runtime/demo.jpg",
               mimeType: "image/jpeg",
               fileSize: 2048,
               originalName: "demo.jpg"
@@ -456,7 +456,7 @@ describe("bootstrap integration", () => {
         {
           draftId: "draft-media-tail",
           sessionKey: "weixin:default::wx:c2c:wxid-2",
-          text: "59427003/AI/qq-codex-bridge/runtime/demo.jpg</qqmedia>",
+          text: "59427003/AI/codex-desktop-orchestrator/runtime/demo.jpg</qqmedia>",
           createdAt: "2026-04-15T03:21:01.000Z"
         }
       ]);
@@ -489,7 +489,7 @@ describe("bootstrap integration", () => {
           text: "",
           mediaArtifacts: [
             expect.objectContaining({
-              localPath: "/Volumes/13759427003/AI/qq-codex-bridge/runtime/demo.jpg"
+              localPath: "/Volumes/13759427003/AI/codex-desktop-orchestrator/runtime/demo.jpg"
             })
           ]
         })

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import WebSocket from "ws";
 import {
   type CodexControlState,
@@ -16,7 +16,8 @@ import {
 } from "../../../domain/src/message.js";
 import type {
   ConversationRunOptions,
-  DesktopDriverPort
+  DesktopDriverPort,
+  OpenSessionOptions
 } from "../../../ports/src/conversation.js";
 import {
   buildMediaArtifactFromReference,
@@ -25,6 +26,11 @@ import {
 
 const APP_THREAD_REF_PREFIX = "codex-app-thread:";
 const LEGACY_THREAD_REF_PREFIX = "codex-thread:";
+const CLIENT_INFO = {
+  name: "codex-desktop-orchestrator",
+  title: "Codex Desktop Orchestrator",
+  version: "0.0.1"
+};
 
 type JsonRpcId = number;
 
@@ -134,6 +140,7 @@ type CodexAppServerDriverOptions = {
   replyTimeoutMs?: number;
   requestTimeoutMs?: number;
   staleTurnInterruptMs?: number;
+  defaultCwd?: string | null;
   sleep?: (ms: number) => Promise<void>;
   createWebSocket?: (url: string) => CodexAppServerSocket;
   controlFallback?: Pick<
@@ -158,8 +165,10 @@ export class CodexAppServerDriver implements DesktopDriverPort {
   > | null;
   private readonly externalAppServerUrl: string | null;
   private readonly codexBinaryPath: string;
+  private readonly defaultCwd: string | null;
   private appServerUrl: string | null = null;
   private child: ChildProcess | null = null;
+  private managedAppServerStartError: Error | null = null;
   private socket: CodexAppServerSocket | null = null;
   private connectPromise: Promise<void> | null = null;
   private nextRequestId = 1;
@@ -184,6 +193,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       options.codexBinaryPath
       ?? process.env.CODEX_BINARY_PATH
       ?? resolveDefaultCodexBinaryPath();
+    this.defaultCwd = normalizeCwd(options.defaultCwd ?? process.env.CODEX_WORKSPACE_CWD ?? null);
     this.connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
     this.replyTimeoutMs = options.replyTimeoutMs ?? 10 * 60_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
@@ -200,6 +210,33 @@ export class CodexAppServerDriver implements DesktopDriverPort {
 
   async ensureAppReady(): Promise<void> {
     await this.ensureConnected();
+  }
+
+  async shutdown(): Promise<void> {
+    this.socket?.close();
+    this.socket = null;
+    this.initialized = false;
+    this.appServerUrl = null;
+
+    for (const pending of this.pendingRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new DesktopDriverError("Codex app-server driver is shutting down", "app_not_ready"));
+    }
+    this.pendingRequests.clear();
+
+    for (const pending of this.pendingTurnsBySession.values()) {
+      pending.reject(new DesktopDriverError("Codex app-server driver is shutting down", "reply_timeout"));
+    }
+    this.pendingTurnsBySession.clear();
+    this.pendingTurnsByKey.clear();
+
+    const child = this.child;
+    this.child = null;
+    if (!child?.pid) {
+      return;
+    }
+
+    await terminateProcessTree(child);
   }
 
   async getControlState(binding: DriverBinding | null = null): Promise<CodexControlState> {
@@ -269,7 +306,8 @@ export class CodexAppServerDriver implements DesktopDriverPort {
 
   async openOrBindSession(
     sessionKey: string,
-    binding: DriverBinding | null
+    binding: DriverBinding | null,
+    options: OpenSessionOptions = {}
   ): Promise<DriverBinding> {
     await this.ensureConnected();
 
@@ -286,16 +324,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       };
     }
 
-    const latestThread = await this.getLatestThread();
-    if (latestThread) {
-      const summary = this.threadToSummary(latestThread, 1);
-      return {
-        sessionKey,
-        codexThreadRef: summary.threadRef
-      };
-    }
-
-    return this.createThread(sessionKey, "");
+    return this.createThread(sessionKey, "", options);
   }
 
   async listRecentThreads(limit: number): Promise<CodexThreadSummary[]> {
@@ -332,10 +361,14 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     };
   }
 
-  async createThread(sessionKey: string, seedPrompt: string): Promise<DriverBinding> {
+  async createThread(
+    sessionKey: string,
+    seedPrompt: string,
+    options: OpenSessionOptions = {}
+  ): Promise<DriverBinding> {
     await this.ensureConnected();
     const response = await this.request<{ thread?: ThreadRecord }>("thread/start", {
-      cwd: process.cwd(),
+      cwd: this.resolveCwd(options.cwd),
       experimentalRawEvents: false,
       persistExtendedHistory: true
     });
@@ -365,6 +398,10 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     }
 
     return binding;
+  }
+
+  private resolveCwd(cwd: string | null | undefined): string {
+    return normalizeCwd(cwd) ?? this.defaultCwd ?? process.cwd();
   }
 
   async sendUserMessage(binding: DriverBinding, message: InboundMessage): Promise<void> {
@@ -472,13 +509,12 @@ export class CodexAppServerDriver implements DesktopDriverPort {
 
     while (Date.now() - startedAt < this.connectTimeoutMs) {
       try {
+        if (this.managedAppServerStartError) {
+          throw this.managedAppServerStartError;
+        }
         await this.openSocket(url);
         await this.request("initialize", {
-          clientInfo: {
-            name: "qq-codex-bridge",
-            title: "QQ Codex Bridge",
-            version: "0.1.3"
-          },
+          clientInfo: CLIENT_INFO,
           capabilities: {
             experimentalApi: true
           }
@@ -506,18 +542,42 @@ export class CodexAppServerDriver implements DesktopDriverPort {
 
     const port = await getFreePort();
     const url = `ws://127.0.0.1:${port}`;
-    this.child = spawn(
-      this.codexBinaryPath,
-      ["app-server", "--listen", url, "-c", "analytics.enabled=false"],
-      {
-        stdio: ["ignore", "pipe", "pipe"]
-      }
-    );
+    this.managedAppServerStartError = null;
+    try {
+      this.child = spawn(
+        this.codexBinaryPath,
+        ["app-server", "--listen", url, "-c", "analytics.enabled=false"],
+        {
+          stdio: ["ignore", "pipe", "pipe"],
+          shell: shouldSpawnCodexViaShell(this.codexBinaryPath)
+        }
+      );
+    } catch (error) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      this.managedAppServerStartError = normalized;
+      this.appServerUrl = url;
+      console.error("[codex-desktop-orchestrator] codex app-server failed to start", {
+        binary: this.codexBinaryPath,
+        error: normalized.message
+      });
+      return url;
+    }
     this.child.on("exit", () => {
       this.socket?.close();
       this.socket = null;
       this.initialized = false;
       this.appServerUrl = null;
+    });
+    this.child.on("error", (error) => {
+      this.managedAppServerStartError = error;
+      this.socket?.close();
+      this.socket = null;
+      this.initialized = false;
+      this.appServerUrl = null;
+      console.error("[codex-desktop-orchestrator] codex app-server failed to start", {
+        binary: this.codexBinaryPath,
+        error: error.message
+      });
     });
     this.child.stderr?.on("data", (chunk) => {
       this.logCodexAppServerStderr(String(chunk));
@@ -525,11 +585,11 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     this.child.stdout?.on("data", (chunk) => {
       const text = String(chunk).trim();
       if (text) {
-        console.info("[qq-codex-bridge] codex app-server", { text });
+        console.info("[codex-desktop-orchestrator] codex app-server", { text });
       }
     });
     this.appServerUrl = url;
-    console.info("[qq-codex-bridge] codex app-server starting", {
+    console.info("[codex-desktop-orchestrator] codex app-server starting", {
       url,
       binary: this.codexBinaryPath
     });
@@ -542,7 +602,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       return;
     }
 
-    console.warn("[qq-codex-bridge] codex app-server stderr", { text });
+    console.warn("[codex-desktop-orchestrator] codex app-server stderr", { text });
   }
 
   private async openSocket(url: string): Promise<void> {
@@ -574,7 +634,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       this.pendingRequests.clear();
     });
     socket.on("error", (error) => {
-      console.warn("[qq-codex-bridge] codex app-server websocket error", {
+      console.warn("[codex-desktop-orchestrator] codex app-server websocket error", {
         error: error.message
       });
     });
@@ -641,7 +701,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
         id: message.id,
         error: {
           code: -32601,
-          message: "qq-codex-bridge does not handle server requests yet"
+          message: "codex-desktop-orchestrator does not handle server requests yet"
         }
       }));
       return;
@@ -709,7 +769,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       pending.reject(
         new DesktopDriverError(
           `Codex app-server turn failed: ${pending.failedReason}`,
-          "reply_timeout"
+          getFailedTurnReason(params.turn.error)
         )
       );
       return;
@@ -798,7 +858,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       return;
     }
     this.lastNotificationForwardErrorAt = now;
-    console.warn("[qq-codex-bridge] codex app ui notification forward failed", {
+    console.warn("[codex-desktop-orchestrator] codex app ui notification forward failed", {
       error: error instanceof Error ? error.message : String(error)
     });
   }
@@ -851,7 +911,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
 
     for (const turn of staleTurns) {
       await this.interruptTurn(threadId, turn.id!).catch((error) => {
-        console.warn("[qq-codex-bridge] codex stale turn interrupt failed", {
+        console.warn("[codex-desktop-orchestrator] codex stale turn interrupt failed", {
           threadId,
           turnId: turn.id,
           error: error instanceof Error ? error.message : String(error)
@@ -954,6 +1014,68 @@ type RateLimitWindow = {
 function resolveDefaultCodexBinaryPath(): string {
   const appBundleBinary = "/Applications/Codex.app/Contents/Resources/codex";
   return fs.existsSync(appBundleBinary) ? appBundleBinary : "codex";
+}
+
+function shouldSpawnCodexViaShell(binaryPath: string): boolean {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  return !/\.exe$/i.test(binaryPath);
+}
+
+function normalizeCwd(cwd: string | null | undefined): string | null {
+  const value = cwd?.trim();
+  return value ? value : null;
+}
+
+function getFailedTurnReason(error: unknown): DesktopDriverError["reason"] {
+  if (containsText(error, "context_length_exceeded")) {
+    return "context_length_exceeded";
+  }
+  if (isCodexServiceError(error)) {
+    return "service_error";
+  }
+  return "submit_failed";
+}
+
+function isCodexServiceError(value: unknown): boolean {
+  return containsText(value, "service_error");
+}
+
+function containsText(value: unknown, needle: string): boolean {
+  if (typeof value === "string") {
+    return value.includes(needle);
+  }
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  return Object.values(value).some((entry) => containsText(entry, needle));
+}
+
+async function terminateProcessTree(child: ChildProcess): Promise<void> {
+  const pid = child.pid;
+  if (!pid) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    await new Promise<void>((resolve) => {
+      execFile("taskkill.exe", ["/pid", String(pid), "/t", "/f"], { windowsHide: true }, () => resolve());
+    });
+    return;
+  }
+
+  child.kill("SIGTERM");
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve();
+    }, 2_000);
+    child.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
 }
 
 function stripAnsi(text: string): string {

@@ -1,7 +1,7 @@
 ---
 name: qq-codex-media
 description: QQ 与 Codex 之间的富媒体双向桥接技能。支持 QQ 入站图片、文件、语音、视频进入 Codex 上下文，也支持 Codex 通过 <qqmedia> 标签或 Markdown 声明回发媒体到 QQ。
-metadata: {"codex":{"emoji":"📎","repo":"qq-codex-bridge"}}
+metadata: {"codex":{"emoji":"📎","repo":"codex-desktop-orchestrator"}}
 ---
 
 # QQ Codex 富媒体

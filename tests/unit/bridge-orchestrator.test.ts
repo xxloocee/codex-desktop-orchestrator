@@ -235,7 +235,7 @@ describe("BridgeOrchestrator", () => {
       })
     );
     expect(warnSpy).toHaveBeenCalledWith(
-      "[qq-codex-bridge] duplicate inbound suppressed",
+      "[codex-desktop-orchestrator] duplicate inbound suppressed",
       expect.objectContaining({
         messageId: secondMessage.messageId,
         sessionKey: secondMessage.sessionKey
@@ -301,7 +301,7 @@ describe("BridgeOrchestrator", () => {
     expect(transcriptStore.recordInbound).toHaveBeenNthCalledWith(2, secondMessage);
     expect(conversationProvider.runTurn).toHaveBeenCalledTimes(2);
     expect(warnSpy).toHaveBeenCalledWith(
-      "[qq-codex-bridge] duplicate inbound suppressed",
+      "[codex-desktop-orchestrator] duplicate inbound suppressed",
       expect.objectContaining({
         messageId: repeatedFirstMessage.messageId,
         sessionKey: repeatedFirstMessage.sessionKey
@@ -546,7 +546,7 @@ describe("BridgeOrchestrator", () => {
       "draft-1: delivery failed"
     );
     expect(warnSpy).toHaveBeenCalledWith(
-      "[qq-codex-bridge] draft delivery failed",
+      "[codex-desktop-orchestrator] draft delivery failed",
       expect.objectContaining({
         sessionKey: message.sessionKey,
         messageId: message.messageId,
@@ -604,7 +604,7 @@ describe("BridgeOrchestrator", () => {
     );
     expect(qqEgress.deliver).not.toHaveBeenCalled();
     expect(warnSpy).toHaveBeenCalledWith(
-      "[qq-codex-bridge] recoverable turn error",
+      "[codex-desktop-orchestrator] recoverable turn error",
       expect.objectContaining({
         messageId: message.messageId,
         sessionKey: message.sessionKey,

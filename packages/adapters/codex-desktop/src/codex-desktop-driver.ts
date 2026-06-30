@@ -370,7 +370,7 @@ export class CodexDesktopDriver implements DesktopDriverPort {
       return;
     }
 
-    console.warn("[qq-codex-bridge] codex composer submit not yet confirmed", {
+    console.warn("[codex-desktop-orchestrator] codex composer submit not yet confirmed", {
       sessionKey: binding.sessionKey,
       messageId: message.messageId,
       targetId,
@@ -412,7 +412,7 @@ export class CodexDesktopDriver implements DesktopDriverPort {
 
     this.pendingReplyBaselines.delete(binding.sessionKey);
     this.pendingLocalRolloutCursors.delete(binding.sessionKey);
-    console.error("[qq-codex-bridge] codex composer submit failed", {
+    console.error("[codex-desktop-orchestrator] codex composer submit failed", {
       sessionKey: binding.sessionKey,
       messageId: message.messageId,
       targetId,

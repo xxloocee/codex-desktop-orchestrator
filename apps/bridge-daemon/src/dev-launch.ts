@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { discoverCodexInstallations } from "./codex-discovery.js";
 
 type FetchLike = typeof fetch;
 
@@ -94,6 +95,21 @@ export function launchCodexDesktop(
     return;
   }
 
+  if (platform === "win32") {
+    const executablePath = deps.appExecutablePath
+      ?? discoverCodexInstallations().desktopPath;
+    if (!executablePath) {
+      throw new Error("Codex Desktop was not discovered; set CODEX_APP_PATH or CODEX_DESKTOP_PATH");
+    }
+
+    const child = spawnFn(executablePath, [portArg], {
+      detached: true,
+      stdio: "ignore"
+    });
+    child.unref();
+    return;
+  }
+
   throw new Error(`Unsupported platform for automatic Codex launch: ${platform}`);
 }
 
@@ -127,7 +143,8 @@ export function resolveDarwinAppExecutablePath(
 
   for (const searchRoot of searchRoots) {
     for (const candidateName of appNames) {
-      const candidate = path.join(
+      const joinPath = searchRoot.startsWith("/") ? path.posix.join : path.join;
+      const candidate = joinPath(
         searchRoot,
         `${candidateName}.app`,
         "Contents",

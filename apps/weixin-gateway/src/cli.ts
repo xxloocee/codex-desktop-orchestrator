@@ -130,7 +130,7 @@ export async function runCli(rawArgs: string[], deps: CliDeps = {}): Promise<num
 
   const parsedArgs = parseCliArgs(args);
   if (!parsedArgs) {
-    writeStderr(`[qq-codex-weixin-gateway] 未知命令：${args.join(" ")}`);
+    writeStderr(`[codex-desktop-weixin-gateway] 未知命令：${args.join(" ")}`);
     printHelp(writeStdout);
     return 1;
   }
@@ -163,8 +163,8 @@ export async function runCli(rawArgs: string[], deps: CliDeps = {}): Promise<num
         accountId: selectedAccountId,
         force: parsedArgs.forceLogin,
         onQrCode: (url) => {
-          writeStdout(`[qq-codex-weixin-gateway] 二维码地址：${url}`);
-          writeStdout("[qq-codex-weixin-gateway] 请在浏览器打开二维码地址并使用微信扫码确认。");
+          writeStdout(`[codex-desktop-weixin-gateway] 二维码地址：${url}`);
+          writeStdout("[codex-desktop-weixin-gateway] 请在浏览器打开二维码地址并使用微信扫码确认。");
         },
         config,
         stateStore: stateStore as WeixinGatewayStateStore,
@@ -172,10 +172,10 @@ export async function runCli(rawArgs: string[], deps: CliDeps = {}): Promise<num
       });
 
       if (result.qrcodeUrl) {
-        writeStdout(`[qq-codex-weixin-gateway] 微信扫码登录成功，accountId=${result.accountId}`);
+        writeStdout(`[codex-desktop-weixin-gateway] 微信扫码登录成功，accountId=${result.accountId}`);
       } else {
         writeStdout(
-          `[qq-codex-weixin-gateway] 账号 ${result.accountId} 已存在可用登录态，baseUrl=${result.baseUrl}`
+          `[codex-desktop-weixin-gateway] 账号 ${result.accountId} 已存在可用登录态，baseUrl=${result.baseUrl}`
         );
       }
       return 0;
@@ -183,7 +183,7 @@ export async function runCli(rawArgs: string[], deps: CliDeps = {}): Promise<num
 
     if (parsedArgs.command === "logout") {
       stateStore.clearStoredAccount(selectedAccountId);
-      writeStdout(`[qq-codex-weixin-gateway] 已清理账号 ${selectedAccountId} 的登录态`);
+      writeStdout(`[codex-desktop-weixin-gateway] 已清理账号 ${selectedAccountId} 的登录态`);
       return 0;
     }
 
@@ -215,12 +215,12 @@ export async function runCli(rawArgs: string[], deps: CliDeps = {}): Promise<num
     return 0;
   } catch (error) {
     if (error instanceof ZodError) {
-      writeStderr(`[qq-codex-weixin-gateway] 配置无效：${error.issues.map((issue) => issue.message).join("; ")}`);
+      writeStderr(`[codex-desktop-weixin-gateway] 配置无效：${error.issues.map((issue) => issue.message).join("; ")}`);
       return 1;
     }
 
     writeStderr(
-      `[qq-codex-weixin-gateway] fatal: ${error instanceof Error ? error.message : String(error)}`
+      `[codex-desktop-weixin-gateway] fatal: ${error instanceof Error ? error.message : String(error)}`
     );
     if (error instanceof Error && error.stack) {
       writeStderr(`  stack: ${error.stack}`);
@@ -317,7 +317,7 @@ export async function startWeixinGatewayService(
 
       if (!runtimeAccount) {
         if (activeClients.has(account.accountId)) {
-          writeStdout(`[qq-codex-weixin-gateway] 未找到微信登录态，已停用 long-poll client { accountId: ${account.accountId} }`);
+          writeStdout(`[codex-desktop-weixin-gateway] 未找到微信登录态，已停用 long-poll client { accountId: ${account.accountId} }`);
           await closeActiveClient(account.accountId);
         }
         continue;
@@ -350,7 +350,7 @@ export async function startWeixinGatewayService(
       activeClientKeys.set(account.accountId, nextClientKey);
       void nextClient.connect();
       writeStdout(
-        `[qq-codex-weixin-gateway] 微信 client 已连接 { reason: ${reason}, accountId: ${runtimeAccount.accountId}, baseUrl: ${runtimeAccount.baseUrl} }`
+        `[codex-desktop-weixin-gateway] 微信 client 已连接 { reason: ${reason}, accountId: ${runtimeAccount.accountId}, baseUrl: ${runtimeAccount.baseUrl} }`
       );
     }
 
@@ -459,7 +459,7 @@ export async function startWeixinGatewayService(
           await refreshWeixinClient("state-file-change");
         } catch (error) {
           writeStderr(
-            `[qq-codex-weixin-gateway] 刷新微信状态失败：${error instanceof Error ? error.message : String(error)}`
+            `[codex-desktop-weixin-gateway] 刷新微信状态失败：${error instanceof Error ? error.message : String(error)}`
           );
         }
       }
@@ -467,7 +467,7 @@ export async function startWeixinGatewayService(
   }
 
   writeStdout(
-    `[qq-codex-weixin-gateway] ready { listenHost: ${config.listenHost}, listenPort: ${config.listenPort}, accounts: ${config.accounts.map((account) => account.accountId).join(",")}, loggedIn: ${activeClients.size} }`
+    `[codex-desktop-weixin-gateway] ready { listenHost: ${config.listenHost}, listenPort: ${config.listenPort}, accounts: ${config.accounts.map((account) => account.accountId).join(",")}, loggedIn: ${activeClients.size} }`
   );
 
   return {
@@ -501,7 +501,7 @@ function initEnvTemplate(options: {
 }) {
   const targetPath = path.join(options.cwd, ".env.weixin-gateway");
   if (fs.existsSync(targetPath)) {
-    options.writeStderr(`[qq-codex-weixin-gateway] 配置文件已存在：${targetPath}`);
+    options.writeStderr(`[codex-desktop-weixin-gateway] 配置文件已存在：${targetPath}`);
     return 1;
   }
 
@@ -530,8 +530,8 @@ function initEnvTemplate(options: {
   ].join("\n");
   fs.writeFileSync(targetPath, template, "utf8");
 
-  options.writeStdout(`[qq-codex-weixin-gateway] 已生成真实微信网关配置：${targetPath}`);
-  options.writeStdout("[qq-codex-weixin-gateway] 你也可以直接把这些变量写进项目根目录的 .env。");
+  options.writeStdout(`[codex-desktop-weixin-gateway] 已生成真实微信网关配置：${targetPath}`);
+  options.writeStdout("[codex-desktop-weixin-gateway] 你也可以直接把这些变量写进项目根目录的 .env。");
   return 0;
 }
 
@@ -556,15 +556,15 @@ function resolveOutboundAccountId(
 }
 
 function printHelp(writeStdout: (line: string) => void) {
-  writeStdout("qq-codex-weixin-gateway");
+  writeStdout("codex-desktop-weixin-gateway");
   writeStdout("");
   writeStdout("用法：");
-  writeStdout("  qq-codex-weixin-gateway                         启动真实微信网关（long-poll + 本地转发）");
-  writeStdout("  qq-codex-weixin-gateway init                    生成 .env.weixin-gateway 模板");
-  writeStdout("  qq-codex-weixin-gateway --weixin-login          发起微信扫码登录");
-  writeStdout("  qq-codex-weixin-gateway --weixin-login-force    强制重新扫码登录");
-  writeStdout("  qq-codex-weixin-gateway --weixin-logout         清理微信登录态");
-  writeStdout("  qq-codex-weixin-gateway help                    查看帮助");
+  writeStdout("  codex-desktop-weixin-gateway                         启动真实微信网关（long-poll + 本地转发）");
+  writeStdout("  codex-desktop-weixin-gateway init                    生成 .env.weixin-gateway 模板");
+  writeStdout("  codex-desktop-weixin-gateway --weixin-login          发起微信扫码登录");
+  writeStdout("  codex-desktop-weixin-gateway --weixin-login-force    强制重新扫码登录");
+  writeStdout("  codex-desktop-weixin-gateway --weixin-logout         清理微信登录态");
+  writeStdout("  codex-desktop-weixin-gateway help                    查看帮助");
 }
 
 function findPackageRoot(startDir: string) {

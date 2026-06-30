@@ -164,7 +164,7 @@ export class QqMediaDownloader implements QqMediaDownloadPort {
 
     if (this.options.stt && !shouldPreferAsrFallback) {
       const startedAt = Date.now();
-      console.info("[qq-codex-bridge] qq stt started", {
+      console.info("[codex-desktop-orchestrator] qq stt started", {
         provider: this.options.stt.provider,
         file: input.localPath,
         extension,
@@ -173,7 +173,7 @@ export class QqMediaDownloader implements QqMediaDownloadPort {
       try {
         const text = await transcribeAudioFile(input.localPath, this.options.stt, this.sttFetchFn);
         if (text) {
-          console.info("[qq-codex-bridge] qq stt completed", {
+          console.info("[codex-desktop-orchestrator] qq stt completed", {
             provider: this.options.stt.provider,
             file: input.localPath,
             durationMs: Date.now() - startedAt,
@@ -184,13 +184,13 @@ export class QqMediaDownloader implements QqMediaDownloadPort {
             source: "stt"
           };
         }
-        console.info("[qq-codex-bridge] qq stt produced no transcript", {
+        console.info("[codex-desktop-orchestrator] qq stt produced no transcript", {
           provider: this.options.stt.provider,
           file: input.localPath,
           durationMs: Date.now() - startedAt
         });
       } catch (error) {
-        console.error("[qq-codex-bridge] qq stt failed", {
+        console.error("[codex-desktop-orchestrator] qq stt failed", {
           provider: this.options.stt.provider,
           error: error instanceof Error ? error.message : String(error),
           file: input.localPath,
@@ -200,7 +200,7 @@ export class QqMediaDownloader implements QqMediaDownloadPort {
     }
 
     if (asrReferText) {
-      console.info("[qq-codex-bridge] qq stt fallback used", {
+      console.info("[codex-desktop-orchestrator] qq stt fallback used", {
         source: "asr",
         file: input.localPath,
         transcriptPreview: asrReferText.slice(0, 80)

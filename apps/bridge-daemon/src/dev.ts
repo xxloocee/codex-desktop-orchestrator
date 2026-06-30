@@ -1,9 +1,9 @@
-import { loadConfigFromEnv } from "./config.js";
+import { loadConfig } from "./config.js";
 import { ensureCodexDesktopForDev } from "./dev-launch.js";
-import { runBridgeDaemon } from "./main.js";
+import { installBridgeRuntimeSignalHandlers, runBridgeDaemon } from "./main.js";
 
 async function runDev() {
-  const config = loadConfigFromEnv(process.env);
+  const config = loadConfig(process.env);
   const result = await ensureCodexDesktopForDev({
     appName: config.codexDesktop.appName,
     remoteDebuggingPort: config.codexDesktop.remoteDebuggingPort,
@@ -11,17 +11,18 @@ async function runDev() {
     startupPollIntervalMs: Number(process.env.CODEX_CDP_POLL_INTERVAL_MS ?? "500")
   });
 
-  console.log("[qq-codex-bridge] codex desktop ready", {
+  console.log("[codex-desktop-orchestrator] codex desktop ready", {
     launched: result.launched,
     remoteDebuggingPort: config.codexDesktop.remoteDebuggingPort
   });
 
-  await runBridgeDaemon();
+  const runtime = await runBridgeDaemon();
+  installBridgeRuntimeSignalHandlers(runtime);
 }
 
 runDev().catch((error) => {
   const cause = error instanceof Error ? error.cause : undefined;
-  console.error("[qq-codex-bridge] fatal:", error instanceof Error ? error.message : String(error));
+  console.error("[codex-desktop-orchestrator] fatal:", error instanceof Error ? error.message : String(error));
   if (cause !== undefined) {
     console.error("  caused by:", cause);
   }

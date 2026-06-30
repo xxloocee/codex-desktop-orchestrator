@@ -1,12 +1,26 @@
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { DesktopDriverError } from "../../../packages/domain/src/driver.js";
 import type { InboundMessage, OutboundDraft, TurnEvent } from "../../../packages/domain/src/message.js";
+import { authorizeInboundMessage, type AccessDecision } from "./access-control.js";
 import { bootstrap, INTERNAL_TURN_EVENT_PATH } from "./bootstrap.js";
+import { updateRuntimeConfigFile } from "./config-management.js";
 import { createBridgeHttpServer } from "./http-server.js";
+import {
+  clearRuntimeState,
+  appendRuntimeLog,
+  ensureManagementToken,
+  readRuntimeLogTail,
+  readRuntimeStatus,
+  runtimePaths,
+  writeRuntimeState
+} from "./runtime-state.js";
 import { ThreadCommandHandler } from "./thread-command-handler.js";
 import { startWeixinGatewayService, type WeixinGatewayServiceHandle } from "../../weixin-gateway/src/cli.js";
 
 type IngressMessageHandlerDeps = {
+  accessControl?: Parameters<typeof authorizeInboundMessage>[1];
+  onRejected?: (message: InboundMessage, decision: AccessDecision) => void;
   threadCommandHandler: Pick<ThreadCommandHandler, "handleIfCommand">;
   orchestrator: {
     handleInbound: (message: InboundMessage) => Promise<void>;
@@ -18,6 +32,12 @@ type IngressMessageHandlerDeps = {
 
 export function createIngressMessageHandler(deps: IngressMessageHandlerDeps) {
   return async (message: InboundMessage) => {
+    const decision = authorizeInboundMessage(message, deps.accessControl);
+    if (!decision.allowed) {
+      deps.onRejected?.(message, decision);
+      return;
+    }
+
     try {
       const handled = await deps.threadCommandHandler.handleIfCommand(message);
       if (handled) {
@@ -26,7 +46,7 @@ export function createIngressMessageHandler(deps: IngressMessageHandlerDeps) {
       await deps.orchestrator.handleInbound(message);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error("[qq-codex-bridge] message handling failed", {
+      console.error("[codex-desktop-orchestrator] message handling failed", {
         messageId: message.messageId,
         sessionKey: message.sessionKey,
         error: errorMessage
@@ -39,13 +59,13 @@ export function createIngressMessageHandler(deps: IngressMessageHandlerDeps) {
           const errorDraft: OutboundDraft = {
             draftId: randomUUID(),
             sessionKey: message.sessionKey,
-            text: `[桥接层错误] ${errorMessage}`,
+            text: buildBridgeErrorReplyText(error, errorMessage),
             createdAt: new Date().toISOString(),
             replyToMessageId: message.messageId
           };
           await deps.errorEgress.deliver(errorDraft);
         } catch (replyError) {
-          console.warn("[qq-codex-bridge] failed to send error reply", {
+          console.warn("[codex-desktop-orchestrator] failed to send error reply", {
             replyError: replyError instanceof Error ? replyError.message : String(replyError)
           });
         }
@@ -54,14 +74,29 @@ export function createIngressMessageHandler(deps: IngressMessageHandlerDeps) {
   };
 }
 
-type BridgeRuntimeHandle = {
+function buildBridgeErrorReplyText(error: unknown, errorMessage: string): string {
+  if (error instanceof DesktopDriverError && error.reason === "context_length_exceeded") {
+    return [
+      "[bridge error] Current Codex thread exceeds the model context window.",
+      "Start a fresh thread with /tn <title>, or use /new <project-alias> <task>, then send the task again."
+    ].join("\n");
+  }
+  return `[bridge error] ${errorMessage}`;
+}
+
+export type BridgeRuntimeHandle = {
   shutdown(): Promise<void>;
   channels: string[];
 };
 
 export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
   const app = bootstrap();
+  const paths = runtimePaths();
+  const managementToken = ensureManagementToken(paths);
+  const qqGatewayDisabled = process.env.QQ_CODEX_DISABLE_QQ_GATEWAY === "1"
+    || process.env.QQ_CODEX_DISABLE_QQ_GATEWAY === "true";
   const managedServices: Array<Pick<WeixinGatewayServiceHandle, "shutdown">> = [];
+  let runtimeHandle: BridgeRuntimeHandle | null = null;
   const configuredAccountKeys = Object.keys(app.orchestrators.byAccountKey);
   const qqIngressHandlers = Object.entries(app.adapters.qqByAccountKey).map(([accountKey, adapter]) => {
     const orchestrator = app.orchestrators.byAccountKey[accountKey];
@@ -74,7 +109,8 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       desktopDriver: app.adapters.codexDesktop,
       qqEgress: adapter.egress,
       chatgptDriver: app.chatgptDriver,
-      accountKeys: configuredAccountKeys
+      accountKeys: configuredAccountKeys,
+      projectAliases: app.config.projectAliases
     });
     return {
       accountKey,
@@ -82,7 +118,9 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       ingressHandler: createIngressMessageHandler({
         threadCommandHandler,
         orchestrator,
-        errorEgress: adapter.egress
+        errorEgress: adapter.egress,
+        accessControl: app.config.accessControl,
+        onRejected: logRejectedInbound
       })
     };
   });
@@ -97,7 +135,8 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       desktopDriver: app.adapters.codexDesktop,
       qqEgress: adapter.egress,
       chatgptDriver: app.chatgptDriver,
-      accountKeys: configuredAccountKeys
+      accountKeys: configuredAccountKeys,
+      projectAliases: app.config.projectAliases
     });
     return {
       accountKey,
@@ -105,11 +144,101 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       ingressHandler: createIngressMessageHandler({
         threadCommandHandler,
         orchestrator,
-        errorEgress: adapter.egress
+        errorEgress: adapter.egress,
+        accessControl: app.config.accessControl,
+        onRejected: logRejectedInbound
       })
     };
   });
   const bridgeHttpServer = createBridgeHttpServer([
+    {
+      routePath: "/health",
+      method: "GET",
+      allowOnlyLocal: true,
+      requiredToken: managementToken,
+      dispatchPayload: async () => ({
+        status: "ok",
+        runtime: readRuntimeStatus(paths),
+        config: {
+          databasePath: app.config.databasePath,
+          listenHost: app.config.runtime.listenHost,
+          listenPort: app.config.runtime.listenPort,
+          conversationProvider: app.config.conversationProvider
+        }
+      })
+    },
+    {
+      routePath: "/status",
+      method: "GET",
+      allowOnlyLocal: true,
+      requiredToken: managementToken,
+      dispatchPayload: async () => readRuntimeStatus(paths)
+    },
+    {
+      routePath: "/logs",
+      method: "GET",
+      allowOnlyLocal: true,
+      requiredToken: managementToken,
+      dispatchPayload: async () => ({
+        logPath: paths.logPath,
+        lines: readRuntimeLogTail(paths, 200)
+      })
+    },
+    {
+      routePath: "/config",
+      method: "GET",
+      allowOnlyLocal: true,
+      requiredToken: managementToken,
+      dispatchPayload: async () => ({
+        configPath: paths.configPath,
+        restartRequired: false,
+        config: redactConfig(app.config)
+      })
+    },
+    {
+      routePath: "/config",
+      method: "PUT",
+      allowOnlyLocal: true,
+      requiredToken: managementToken,
+      respondWithJson: true,
+      dispatchPayload: async (payload) => {
+        const updated = updateRuntimeConfigFile({
+          configPath: paths.configPath,
+          env: process.env,
+          patch: payload
+        });
+        appendRuntimeLog(paths, "config updated restartRequired=true");
+        return {
+          status: "updated",
+          configPath: updated.configPath,
+          restartRequired: true,
+          config: redactConfig(updated.effectiveConfig)
+        };
+      }
+    },
+    {
+      routePath: "/control/stop",
+      method: "POST",
+      allowOnlyLocal: true,
+      requiredToken: managementToken,
+      respondWithJson: true,
+      dispatchPayload: async () => {
+        const handle = runtimeHandle;
+        if (!handle) {
+          const error = new Error("Bridge runtime is still starting");
+          (error as Error & { statusCode?: number }).statusCode = 503;
+          throw error;
+        }
+        appendRuntimeLog(paths, `stop requested pid=${process.pid}`);
+        setTimeout(() => {
+          void handle.shutdown();
+        }, 0);
+        return {
+          status: "stopping",
+          pid: process.pid
+        };
+      }
+    },
     {
       routePath: INTERNAL_TURN_EVENT_PATH,
       allowOnlyLocal: true,
@@ -118,7 +247,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
         await resolveTurnEventOrchestrator(event, app.orchestrators).handleTurnEvent(event);
       },
       onDispatchError: (error, payload) => {
-        console.warn("[qq-codex-bridge] internal turn event dispatch failed", {
+        console.warn("[codex-desktop-orchestrator] internal turn event dispatch failed", {
           error: error.message,
           payload
         });
@@ -131,7 +260,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
         await route.ingressHandler(message);
       },
       onDispatchError: (error: Error, payload: unknown) => {
-        console.warn("[qq-codex-bridge] weixin webhook dispatch failed", {
+        console.warn("[codex-desktop-orchestrator] weixin webhook dispatch failed", {
           accountKey: route.accountKey,
           error: error.message,
           payload
@@ -139,6 +268,18 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       }
     }))
   ]);
+
+  function logRejectedInbound(message: InboundMessage, decision: AccessDecision): void {
+    const summary = `rejected account=${message.accountKey} chatType=${message.chatType} sender=${message.senderId} peer=${message.peerKey} reason=${decision.reason}`;
+    appendRuntimeLog(paths, summary);
+    console.warn("[codex-desktop-orchestrator] inbound rejected by access control", {
+      accountKey: message.accountKey,
+      chatType: message.chatType,
+      senderId: message.senderId,
+      peerKey: message.peerKey,
+      reason: decision.reason
+    });
+  }
 
   await new Promise<void>((resolve, reject) => {
     bridgeHttpServer.once("error", reject);
@@ -148,9 +289,14 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     });
   });
 
-  for (const entry of qqIngressHandlers) {
-    await entry.adapter.ingress.onMessage(entry.ingressHandler);
-    await entry.adapter.ingress.start();
+  if (qqGatewayDisabled) {
+    appendRuntimeLog(paths, "qq gateway disabled by QQ_CODEX_DISABLE_QQ_GATEWAY");
+    console.warn("[codex-desktop-orchestrator] qq gateway disabled by QQ_CODEX_DISABLE_QQ_GATEWAY");
+  } else {
+    for (const entry of qqIngressHandlers) {
+      await entry.adapter.ingress.onMessage(entry.ingressHandler);
+      await entry.adapter.ingress.start();
+    }
   }
 
   const channelSet = new Set(qqIngressHandlers.map((entry) => entry.accountKey));
@@ -158,7 +304,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     const weixinService = await startWeixinGatewayService();
     managedServices.push(weixinService);
     channelSet.add(`weixin:${weixinService.status.accountId}`);
-    console.log("[qq-codex-bridge] channel ready", {
+    console.log("[codex-desktop-orchestrator] channel ready", {
       channel: "weixin",
       listenHost: weixinService.status.listenHost,
       listenPort: weixinService.status.listenPort,
@@ -170,8 +316,16 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     channelSet.add(route.accountKey);
   }
   const channels = [...channelSet];
+  writeRuntimeState(paths, {
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    listenHost: app.config.runtime.listenHost,
+    listenPort: app.config.runtime.listenPort,
+    channels,
+    version: process.env.npm_package_version ?? "unknown"
+  });
 
-  console.log("[qq-codex-bridge] ready", {
+  console.log("[codex-desktop-orchestrator] ready", {
     transport: "qq-gateway-websocket",
     accountKeys: channels,
     conversationProvider: app.config.conversationProvider,
@@ -186,21 +340,45 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     channels
   });
 
-  return {
+  let shutdownPromise: Promise<void> | null = null;
+  runtimeHandle = {
     channels,
-    shutdown: async () => {
-      await Promise.allSettled([
-        ...qqIngressHandlers.map((entry) =>
-          new Promise<void>((resolve) => {
-            const maybeClose = entry.adapter.ingress as { stop?: () => Promise<void> | void };
-            Promise.resolve(maybeClose.stop?.()).finally(() => resolve());
-          })
-        ),
-        ...managedServices.map((service) => service.shutdown())
-      ]);
-      await new Promise<void>((resolve) => bridgeHttpServer.close(() => resolve()));
+    shutdown: () => {
+      shutdownPromise ??= (async () => {
+        await Promise.allSettled([
+          ...qqIngressHandlers.map((entry) =>
+            new Promise<void>((resolve) => {
+              const maybeClose = entry.adapter.ingress as { stop?: () => Promise<void> | void };
+              Promise.resolve(maybeClose.stop?.()).finally(() => resolve());
+            })
+          ),
+          ...managedServices.map((service) => service.shutdown())
+        ]);
+        await app.adapters.codexDesktop.shutdown?.();
+        await new Promise<void>((resolve) => bridgeHttpServer.close(() => resolve()));
+        app.db.close();
+        clearRuntimeState(paths);
+      })();
+      return shutdownPromise;
     }
   };
+  return runtimeHandle;
+}
+
+export function installBridgeRuntimeSignalHandlers(runtime: Pick<BridgeRuntimeHandle, "shutdown">): void {
+  let shuttingDown = false;
+  const shutdown = (signal: NodeJS.Signals) => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    void runtime.shutdown().finally(() => {
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    });
+  };
+
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
 }
 
 export function resolveTurnEventOrchestrator(
@@ -232,9 +410,26 @@ function extractAccountKey(sessionKey: string): string | null {
   return accountKey || null;
 }
 
+function redactConfig<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactConfig(item)) as T;
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [
+        key,
+        /secret|token|apiKey|accessKey|clientSecret/i.test(key) && typeof entry === "string"
+          ? "***"
+          : redactConfig(entry)
+      ])
+    ) as T;
+  }
+  return value;
+}
+
 function handleFatal(error: unknown) {
   const cause = error instanceof Error ? error.cause : undefined;
-  console.error("[qq-codex-bridge] fatal:", error instanceof Error ? error.message : String(error));
+  console.error("[codex-desktop-orchestrator] fatal:", error instanceof Error ? error.message : String(error));
   if (cause !== undefined) {
     console.error("  caused by:", cause);
   }
@@ -246,5 +441,5 @@ function handleFatal(error: unknown) {
 
 const entrypoint = process.argv[1];
 if (entrypoint && import.meta.url === pathToFileURL(entrypoint).href) {
-  runBridgeDaemon().catch(handleFatal);
+  runBridgeDaemon().then(installBridgeRuntimeSignalHandlers).catch(handleFatal);
 }

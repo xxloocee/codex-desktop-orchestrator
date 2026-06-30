@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **qq-codex-bridge** (20746 symbols, 31944 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **codex-desktop-orchestrator** (20746 symbols, 31944 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -17,7 +17,7 @@ This project is indexed by GitNexus as **qq-codex-bridge** (20746 symbols, 31944
 
 1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
 2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
-3. `READ gitnexus://repo/qq-codex-bridge/process/{processName}` — trace the full execution flow step by step
+3. `READ gitnexus://repo/codex-desktop-orchestrator/process/{processName}` — trace the full execution flow step by step
 4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
 
 ## When Refactoring
@@ -56,10 +56,10 @@ This project is indexed by GitNexus as **qq-codex-bridge** (20746 symbols, 31944
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/qq-codex-bridge/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/qq-codex-bridge/clusters` | All functional areas |
-| `gitnexus://repo/qq-codex-bridge/processes` | All execution flows |
-| `gitnexus://repo/qq-codex-bridge/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/codex-desktop-orchestrator/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/codex-desktop-orchestrator/clusters` | All functional areas |
+| `gitnexus://repo/codex-desktop-orchestrator/processes` | All execution flows |
+| `gitnexus://repo/codex-desktop-orchestrator/process/{name}` | Step-by-step execution trace |
 
 ## Self-Check Before Finishing
 

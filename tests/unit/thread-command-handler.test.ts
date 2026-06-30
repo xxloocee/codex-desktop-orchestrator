@@ -86,7 +86,7 @@ function createDriver(
       model: "GPT-5.4",
       reasoningEffort: "高",
       workspace: "本地",
-      branch: "codex/qq-codex-bridge",
+      branch: "codex/codex-desktop-orchestrator",
       permissionMode: "完全访问权限",
       quotaSummary: null
     }),
@@ -94,7 +94,7 @@ function createDriver(
       model: "GPT-5.4",
       reasoningEffort: "高",
       workspace: "本地",
-      branch: "codex/qq-codex-bridge",
+      branch: "codex/codex-desktop-orchestrator",
       permissionMode: "完全访问权限",
       quotaSummary: null
     }),
@@ -461,7 +461,7 @@ describe("thread command handler", () => {
         model: "GPT-5.4",
         reasoningEffort: "高",
         workspace: "本地",
-        branch: "codex/qq-codex-bridge",
+        branch: "codex/codex-desktop-orchestrator",
         permissionMode: "完全访问权限",
         quotaSummary: null
       })
@@ -498,7 +498,7 @@ describe("thread command handler", () => {
         model: "GPT-5.4-Mini",
         reasoningEffort: "高",
         workspace: "本地",
-        branch: "codex/qq-codex-bridge",
+        branch: "codex/codex-desktop-orchestrator",
         permissionMode: "完全访问权限",
         quotaSummary: null
       })
@@ -531,7 +531,7 @@ describe("thread command handler", () => {
         model: "GPT-5.4",
         reasoningEffort: "高",
         workspace: "本地",
-        branch: "codex/qq-codex-bridge",
+        branch: "codex/codex-desktop-orchestrator",
         permissionMode: "完全访问权限",
         quotaSummary: null
       }),
@@ -577,11 +577,11 @@ describe("thread command handler", () => {
     const getControlState = vi.fn().mockResolvedValue({
       threadRef: "codex-app-thread:thread-b:fresh-title",
       threadTitle: "线程 B",
-      threadProjectName: "qq-codex-bridge",
+      threadProjectName: "codex-desktop-orchestrator",
       threadRelativeTime: "刚刚",
       model: "GPT-5.4",
       reasoningEffort: "高",
-      workspace: "qq-codex-bridge",
+      workspace: "codex-desktop-orchestrator",
       branch: "codex/weixin-multi-channel",
       permissionMode: "完全访问权限",
       quotaSummary: null
@@ -617,7 +617,7 @@ describe("thread command handler", () => {
     );
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
-        text: expect.stringContaining("工作区：qq-codex-bridge")
+        text: expect.stringContaining("工作区：codex-desktop-orchestrator")
       })
     );
     expect(qqEgress.deliver).toHaveBeenCalledWith(
@@ -886,6 +886,154 @@ describe("thread command handler", () => {
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
         text: expect.stringContaining("| 查看额度信息 | `/quota` | `/q` |")
+      })
+    );
+  });
+
+  it("lists Codex Desktop projects from recent threads for /projects", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver();
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      desktopDriver,
+      qqEgress
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/projects"))).resolves.toBe(true);
+
+    expect(desktopDriver.listRecentThreads).toHaveBeenCalledWith(200);
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Codex Desktop projects from recent threads:")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("| skills | 1 |")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("| Desktop | 1 |")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("uses /aliases")
+      })
+    );
+  });
+
+  it("lists configured cwd aliases for /aliases", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver();
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      desktopDriver,
+      qqEgress,
+      projectAliases: {
+        bridge: {
+          cwd: "D:/Project/github/codex-desktop-orchestrator",
+          label: "Bridge"
+        }
+      }
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/aliases"))).resolves.toBe(true);
+
+    expect(desktopDriver.listRecentThreads).not.toHaveBeenCalled();
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Configured project aliases:")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("| bridge | Bridge | D:/Project/github/codex-desktop-orchestrator |")
+      })
+    );
+  });
+
+  it("creates a codex thread in a configured project cwd for /new", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver();
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      desktopDriver,
+      qqEgress,
+      projectAliases: {
+        "codex-desktop-orchestrator": {
+          cwd: "D:/Project/github/codex-desktop-orchestrator",
+          label: "Codex Desktop Orchestrator"
+        }
+      }
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/new codex-desktop-orchestrator fix startup"))).resolves.toBe(true);
+
+    expect(desktopDriver.createThread).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      expect.stringContaining("fix startup"),
+      {
+        cwd: "D:/Project/github/codex-desktop-orchestrator"
+      }
+    );
+    expect(sessionStore.updateConversationProvider).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      "codex-desktop"
+    );
+    expect(sessionStore.updateBinding).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      "codex-thread:page-1:new"
+    );
+    expect(sessionStore.updateSkillContextKey).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      null
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Created Codex thread for project: Codex Desktop Orchestrator")
+      })
+    );
+  });
+
+  it("rejects /new when the project alias is unknown", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver();
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      desktopDriver,
+      qqEgress,
+      projectAliases: {
+        bridge: {
+          cwd: "D:/Project/github/codex-desktop-orchestrator"
+        }
+      }
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/new missing fix startup"))).resolves.toBe(true);
+
+    expect(desktopDriver.createThread).not.toHaveBeenCalled();
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Unknown project alias: missing")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Use /aliases")
       })
     );
   });

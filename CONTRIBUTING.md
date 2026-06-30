@@ -1,6 +1,6 @@
 # Contributing
 
-感谢你愿意参与 `qq-codex-bridge`。
+感谢你愿意参与 `codex-desktop-orchestrator`。
 
 这个项目目前仍处在快速迭代阶段，欢迎提交 bug 修复、文档改进、测试补充和架构建议。为了让协作更顺畅，请先读完这份说明。
 
@@ -16,7 +16,7 @@
 本地启动：
 
 ```bash
-cd qq-codex-bridge
+cd codex-desktop-orchestrator
 pnpm install
 cp .env.example .env
 pnpm dev

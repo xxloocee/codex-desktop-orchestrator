@@ -124,6 +124,29 @@ describe("dev launch", () => {
     expect(unref).toHaveBeenCalled();
   });
 
+  it("launches Codex on Windows via the discovered executable with a remote debugging port", () => {
+    const unref = vi.fn();
+    const spawnFn = vi.fn().mockReturnValue({
+      unref
+    });
+
+    launchCodexDesktop("Codex", 9229, {
+      platform: "win32",
+      spawnFn,
+      appExecutablePath: "C:\\Users\\me\\AppData\\Local\\Programs\\Codex\\Codex.exe"
+    });
+
+    expect(spawnFn).toHaveBeenCalledWith(
+      "C:\\Users\\me\\AppData\\Local\\Programs\\Codex\\Codex.exe",
+      ["--remote-debugging-port=9229"],
+      {
+        detached: true,
+        stdio: "ignore"
+      }
+    );
+    expect(unref).toHaveBeenCalled();
+  });
+
   it("falls back to Codex.app when the configured app name does not match the installed bundle", () => {
     const executablePath = resolveDarwinAppExecutablePath("Anthropic Codex", {
       searchRoots: ["/Applications"],

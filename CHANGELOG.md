@@ -2,11 +2,18 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的整理方式，并约定使用语义化版本风格来描述发布节奏。
 
-## [Unreleased]
+## [0.0.1] - 2026-06-29
 
-暂无。
+### Changed
 
-## [0.1.4] - 2026-04-26
+- 项目定位与发布元数据迁移为 `codex-desktop-orchestrator`。
+- 移除旧仓库名 CLI 别名和旧 runtime 默认命名，统一使用 `codex-desktop-orchestrator`。
+- 新项目版本从 `0.0.1` 起步，不沿用原项目 `0.1.4` 版本号。
+- ChatGPT Desktop 相关能力作为历史遗留的可选 provider 保留，当前主定位聚焦 Codex Desktop 调度。
+
+## 原项目历史参考：0.1.4 - 2026-04-26
+
+以下记录来自原项目能力基线，仅作为历史参考，不作为本项目发布版本沿用。
 
 ### Added
 

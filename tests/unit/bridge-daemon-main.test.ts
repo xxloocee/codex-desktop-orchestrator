@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
+import { DesktopDriverError } from "../../packages/domain/src/driver.js";
 import type { InboundMessage, TurnEvent } from "../../packages/domain/src/message.js";
 import { createIngressMessageHandler, resolveTurnEventOrchestrator } from "../../apps/bridge-daemon/src/main.js";
 
@@ -57,13 +58,114 @@ describe("bridge daemon main", () => {
 
     await expect(handler(createMessage())).resolves.toBeUndefined();
     expect(errorSpy).toHaveBeenCalledWith(
-      "[qq-codex-bridge] message handling failed",
+      "[codex-desktop-orchestrator] message handling failed",
       expect.objectContaining({
         messageId: "msg-main-1",
         sessionKey: "qqbot:default::qq:c2c:abc-123",
         error: "Codex desktop reply did not arrive before timeout"
       })
     );
+  });
+
+  it("sends a visible bridge error reply when inbound handling fails", async () => {
+    const threadCommandHandler = {
+      handleIfCommand: vi.fn().mockResolvedValue(false)
+    };
+    const orchestrator = {
+      handleInbound: vi.fn().mockRejectedValue(new Error("Codex app-server turn failed"))
+    };
+    const errorEgress = {
+      deliver: vi.fn().mockResolvedValue(undefined)
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const handler = createIngressMessageHandler({
+      threadCommandHandler: threadCommandHandler as any,
+      orchestrator,
+      errorEgress
+    });
+
+    await expect(handler(createMessage())).resolves.toBeUndefined();
+    expect(errorEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: "qqbot:default::qq:c2c:abc-123",
+        replyToMessageId: "msg-main-1",
+        text: "[bridge error] Codex app-server turn failed"
+      })
+    );
+  });
+
+  it("sends an actionable reply when the bound Codex thread exceeds the context window", async () => {
+    const threadCommandHandler = {
+      handleIfCommand: vi.fn().mockResolvedValue(false)
+    };
+    const orchestrator = {
+      handleInbound: vi.fn().mockRejectedValue(
+        new DesktopDriverError("Codex app-server turn failed: context_length_exceeded", "context_length_exceeded")
+      )
+    };
+    const errorEgress = {
+      deliver: vi.fn().mockResolvedValue(undefined)
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const handler = createIngressMessageHandler({
+      threadCommandHandler: threadCommandHandler as any,
+      orchestrator,
+      errorEgress
+    });
+
+    await expect(handler(createMessage())).resolves.toBeUndefined();
+    expect(errorEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: "qqbot:default::qq:c2c:abc-123",
+        replyToMessageId: "msg-main-1",
+        text: expect.stringContaining("Current Codex thread exceeds the model context window")
+      })
+    );
+    expect(errorEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("/tn <title>")
+      })
+    );
+  });
+
+  it("drops unauthorized inbound messages before command or orchestrator handling", async () => {
+    const threadCommandHandler = {
+      handleIfCommand: vi.fn().mockResolvedValue(false)
+    };
+    const orchestrator = {
+      handleInbound: vi.fn().mockResolvedValue(undefined)
+    };
+    const onRejected = vi.fn();
+
+    const handler = createIngressMessageHandler({
+      accessControl: {
+        mode: "deny-by-default",
+        allowedAccountKeys: [],
+        allowedC2cSenderIds: [],
+        allowedGroupIds: [],
+        allowedGroupMemberIds: [],
+        requireMentionInGroup: true,
+        botMentionPatterns: []
+      },
+      onRejected,
+      threadCommandHandler: threadCommandHandler as any,
+      orchestrator
+    });
+
+    const message = createMessage();
+    await handler(message);
+
+    expect(onRejected).toHaveBeenCalledWith(
+      message,
+      expect.objectContaining({
+        allowed: false,
+        reason: "c2c_sender_not_allowed"
+      })
+    );
+    expect(threadCommandHandler.handleIfCommand).not.toHaveBeenCalled();
+    expect(orchestrator.handleInbound).not.toHaveBeenCalled();
   });
 
   it("routes turn events to the matching channel orchestrator based on session key", () => {

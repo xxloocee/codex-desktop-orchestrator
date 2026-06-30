@@ -55,7 +55,7 @@ export class BridgeOrchestrator {
       }
 
       if (this.isLikelyDuplicateInbound(message)) {
-        console.warn("[qq-codex-bridge] duplicate inbound suppressed", {
+        console.warn("[codex-desktop-orchestrator] duplicate inbound suppressed", {
           messageId: message.messageId,
           sessionKey: message.sessionKey
         });
@@ -108,7 +108,7 @@ export class BridgeOrchestrator {
           } catch (error) {
             const reason = error instanceof Error ? error.message : String(error);
             deliveryErrors.push(`${formattedDraft.draftId}: ${reason}`);
-            console.warn("[qq-codex-bridge] draft delivery failed", {
+            console.warn("[codex-desktop-orchestrator] draft delivery failed", {
               sessionKey: message.sessionKey,
               messageId: message.messageId,
               draftId: formattedDraft.draftId,
@@ -138,7 +138,7 @@ export class BridgeOrchestrator {
             BridgeSessionStatus.Active,
             lastError
           );
-          console.warn("[qq-codex-bridge] recoverable turn error", {
+          console.warn("[codex-desktop-orchestrator] recoverable turn error", {
             messageId: message.messageId,
             sessionKey: message.sessionKey,
             error: lastError

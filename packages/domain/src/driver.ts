@@ -34,6 +34,8 @@ export class DesktopDriverError extends Error {
       | "input_not_found"
       | "submit_failed"
       | "reply_timeout"
+      | "context_length_exceeded"
+      | "service_error"
       | "reply_parse_failed"
       | "control_not_found"
   ) {

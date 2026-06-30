@@ -3,7 +3,7 @@
 这份文档对应仓库内置的**真实微信文本网关**。它参考 `qq-codex-runner` 的接法，直接对接微信 long-poll 接口：
 
 - 网关主动轮询微信消息
-- 收到文本后转发给 `qq-codex-bridge`
+- 收到文本后转发给 `codex-desktop-orchestrator`
 - bridge 的文本回复再经本地网关发送回微信
 
 这样你不需要额外再写一层“参考 webhook 适配器”，而是可以直接把微信文本链路跑起来。
@@ -60,19 +60,20 @@ WEIXIN_GATEWAY_STATE_WATCH_INTERVAL_MS=1000
 启动方式：
 
 ```bash
-pnpm dev:weixin-gateway
+pnpm run build
+pnpm start:weixin-gateway
 ```
 
 或者：
 
 ```bash
-qq-codex-weixin-gateway
+codex-desktop-weixin-gateway
 ```
 
 首次扫码登录：
 
 ```bash
-qq-codex-weixin-gateway --weixin-login
+codex-desktop-weixin-gateway --weixin-login
 ```
 
 命令会输出二维码链接。扫码确认后，登录态会写入：

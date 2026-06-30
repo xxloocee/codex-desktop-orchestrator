@@ -595,7 +595,7 @@ describe("codex desktop driver contract", () => {
       model: "GPT-5.4",
       reasoningEffort: "高",
       workspace: "本地工作",
-      branch: "codex/qq-codex-bridge",
+      branch: "codex/codex-desktop-orchestrator",
       permissionMode: "完全访问权限",
       quotaSummary: "5 小时 55%（20:14 重置）\n1 周 68%（4月22日 重置）"
     });
@@ -621,7 +621,7 @@ describe("codex desktop driver contract", () => {
       model: "GPT-5.4",
       reasoningEffort: "高",
       workspace: "本地工作",
-      branch: "codex/qq-codex-bridge",
+      branch: "codex/codex-desktop-orchestrator",
       permissionMode: "完全访问权限",
       quotaSummary: "5 小时 55%（20:14 重置）\n1 周 68%（4月22日 重置）"
     });
@@ -810,9 +810,9 @@ describe("codex desktop driver contract", () => {
             return "GPT-5.4\n中\n完全访问权限\n本地工作";
           }
           if (!uiState.quotaExpanded) {
-            return "继续使用\n在本地处理\ncodex/qq-codex-bridge\n剩余额度\n升级至 Pro\n了解更多";
+            return "继续使用\n在本地处理\ncodex/codex-desktop-orchestrator\n剩余额度\n升级至 Pro\n了解更多";
           }
-          return "继续使用\n在本地处理\ncodex/qq-codex-bridge\n剩余额度\n5 小时\n55%\n20:14\n1 周\n68%\n4月22日\n升级至 Pro\n了解更多";
+          return "继续使用\n在本地处理\ncodex/codex-desktop-orchestrator\n剩余额度\n5 小时\n55%\n20:14\n1 周\n68%\n4月22日\n升级至 Pro\n了解更多";
         }
       }
     };
@@ -850,7 +850,7 @@ describe("codex desktop driver contract", () => {
         model: "GPT-5.4-Mini",
         reasoningEffort: "高",
         workspace: "本地",
-        branch: "codex/qq-codex-bridge",
+        branch: "codex/codex-desktop-orchestrator",
         permissionMode: "完全访问权限",
         quotaSummary: null
       });
@@ -881,7 +881,7 @@ describe("codex desktop driver contract", () => {
       model: "GPT-5.4-Mini",
       reasoningEffort: "高",
       workspace: "本地",
-      branch: "codex/qq-codex-bridge",
+      branch: "codex/codex-desktop-orchestrator",
       permissionMode: "完全访问权限",
       quotaSummary: null
     });

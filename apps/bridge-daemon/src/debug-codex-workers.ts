@@ -434,6 +434,6 @@ function sleep(ms: number): Promise<void> {
 }
 
 void main().catch((error) => {
-  console.error("[qq-codex-bridge] debug-codex-workers failed", error);
+  console.error("[codex-desktop-orchestrator] debug-codex-workers failed", error);
   process.exitCode = 1;
 });

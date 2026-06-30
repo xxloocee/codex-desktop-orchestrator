@@ -185,7 +185,7 @@ export class WeixinClient {
         item_list: itemList
       },
       base_info: {
-        channel_version: "qq-codex-bridge"
+        channel_version: "codex-desktop-orchestrator"
       }
     };
 
@@ -303,7 +303,7 @@ export class WeixinClient {
         no_need_thumb: true,
         aeskey: aesKey.toString("hex"),
         base_info: {
-          channel_version: "qq-codex-bridge"
+          channel_version: "codex-desktop-orchestrator"
         }
       },
       this.options.apiTimeoutMs
@@ -362,7 +362,7 @@ export class WeixinClient {
         {
           get_updates_buf: this.options.stateStore.getSyncCursor(),
           base_info: {
-            channel_version: "qq-codex-bridge"
+            channel_version: "codex-desktop-orchestrator"
           }
         },
         this.options.longPollTimeoutMs,

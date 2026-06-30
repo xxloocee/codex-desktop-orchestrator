@@ -43,6 +43,164 @@ class FakeAppServerSocket extends EventEmitter {
 }
 
 describe("codex app-server driver", () => {
+  it("reports a managed app-server spawn failure without crashing the process", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    class FailingSocket extends EventEmitter {
+      readyState = 0;
+      send(): void {}
+      close(): void {}
+
+      constructor() {
+        super();
+        queueMicrotask(() => {
+          this.emit("error", new Error("socket unavailable"));
+        });
+      }
+    }
+
+    const driver = new CodexAppServerDriver({
+      codexBinaryPath: "__missing_codex_binary_for_test__",
+      connectTimeoutMs: 500,
+      requestTimeoutMs: 100,
+      createWebSocket: () => new FailingSocket() as never,
+      sleep: async () => undefined
+    });
+
+    await expect(driver.ensureAppReady()).rejects.toThrow(
+      /Codex app-server is not ready/
+    );
+    errorSpy.mockRestore();
+  });
+
+  it("closes the app-server socket on shutdown", async () => {
+    const socket = new FakeAppServerSocket();
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+
+    await driver.ensureAppReady();
+    expect(socket.sent[0]).toMatchObject({
+      method: "initialize",
+      params: {
+        clientInfo: {
+          name: "codex-desktop-orchestrator",
+          title: "Codex Desktop Orchestrator",
+          version: "0.0.1"
+        }
+      }
+    });
+    await driver.shutdown();
+
+    expect(socket.readyState).toBe(3);
+  });
+
+  it("starts new app-server threads with the configured cwd", async () => {
+    const socket = new FakeAppServerSocket();
+    const threadStartRequests: unknown[] = [];
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/start", (message) => {
+      threadStartRequests.push(message);
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-new",
+          cwd: "D:/Project/demo"
+        }
+      });
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      defaultCwd: "D:/Project/default",
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+
+    const binding = await driver.createThread("qqbot:default::qq:c2c:user-1", "", {
+      cwd: "D:/Project/demo"
+    });
+
+    expect(threadStartRequests).toHaveLength(1);
+    expect(threadStartRequests[0]).toMatchObject({
+      method: "thread/start",
+      params: {
+        cwd: "D:/Project/demo",
+        experimentalRawEvents: false,
+        persistExtendedHistory: true
+      }
+    });
+    expect(binding.codexThreadRef).toMatch(/^codex-app-thread:thread-new:/);
+  });
+
+  it("starts a new app-server thread instead of binding an unbound session to the latest thread", async () => {
+    const socket = new FakeAppServerSocket();
+    const threadList = vi.fn();
+    const threadStart = vi.fn((message: Record<string, unknown>) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-new",
+          name: "fresh thread",
+          cwd: "D:/Project/demo"
+        }
+      });
+    });
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/list", (message) => {
+      threadList(message);
+      socket.respond(message.id, {
+        data: [
+          {
+            id: "thread-latest",
+            name: "old latest",
+            cwd: "D:/Project/demo"
+          }
+        ]
+      });
+    });
+    socket.onRequest("thread/start", threadStart);
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+
+    const binding = await driver.openOrBindSession("qqbot:default::qq:c2c:user-1", null, {
+      cwd: "D:/Project/demo"
+    });
+
+    expect(threadList).not.toHaveBeenCalled();
+    expect(threadStart).toHaveBeenCalledTimes(1);
+    expect(binding.codexThreadRef).toContain("thread-new");
+  });
+
   it("routes replies by thread id and turn id instead of the active desktop UI", async () => {
     const socket = new FakeAppServerSocket();
     socket.onRequest("initialize", (message) => {
@@ -146,6 +304,150 @@ describe("codex app-server driver", () => {
     });
   });
 
+  it("preserves app-server service errors instead of reporting them as reply timeouts", async () => {
+    const socket = new FakeAppServerSocket();
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("turn/start", (message) => {
+      socket.respond(message.id, {
+        turn: {
+          id: "turn-target"
+        }
+      });
+
+      setTimeout(() => {
+        socket.notify("turn/completed", {
+          threadId: "thread-target",
+          turn: {
+            id: "turn-target",
+            status: "failed",
+            error: {
+              message: "{\"error\":{\"message\":\"service validation failed\",\"type\":\"service_error\",\"param\":\"input\",\"code\":\"service_error\"}}",
+              codexErrorInfo: "other",
+              additionalDetails: null
+            }
+          }
+        });
+      }, 0);
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      replyTimeoutMs: 1_000,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+    const binding = {
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    };
+
+    await driver.sendUserMessage(binding, {
+      messageId: "msg-1",
+      accountKey: "qqbot:default",
+      sessionKey: binding.sessionKey,
+      peerKey: "qq:c2c:user-1",
+      chatType: "c2c",
+      senderId: "user-1",
+      text: "hello",
+      receivedAt: "2026-04-21T14:30:00.000Z"
+    });
+
+    await expect(driver.collectAssistantReply(binding)).rejects.toMatchObject({
+      reason: "service_error"
+    });
+  });
+
+  it("preserves app-server context length errors for user-visible recovery", async () => {
+    const socket = new FakeAppServerSocket();
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("turn/start", (message) => {
+      socket.respond(message.id, {
+        turn: {
+          id: "turn-target"
+        }
+      });
+
+      setTimeout(() => {
+        socket.notify("turn/completed", {
+          threadId: "thread-target",
+          turn: {
+            id: "turn-target",
+            status: "failed",
+            error: {
+              message: "Your input exceeds the context window of this model",
+              kind: "context_length_exceeded",
+              code: "context_length_exceeded"
+            }
+          }
+        });
+      }, 0);
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      replyTimeoutMs: 1_000,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+    const binding = {
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    };
+
+    await driver.sendUserMessage(binding, {
+      messageId: "msg-1",
+      accountKey: "qqbot:default",
+      sessionKey: binding.sessionKey,
+      peerKey: "qq:c2c:user-1",
+      chatType: "c2c",
+      senderId: "user-1",
+      text: "hello",
+      receivedAt: "2026-04-21T14:30:00.000Z"
+    });
+
+    await expect(driver.collectAssistantReply(binding)).rejects.toMatchObject({
+      reason: "context_length_exceeded"
+    });
+  });
+
   it("forwards app-server notifications to the desktop app ui in thread order", async () => {
     const socket = new FakeAppServerSocket();
     const forwarded: Array<{ method: string; params: unknown }> = [];
@@ -166,7 +468,7 @@ describe("codex app-server driver", () => {
         thread: {
           id: "thread-target",
           name: "目标线程",
-          cwd: "/Volumes/workspaces/qq-codex-bridge",
+          cwd: "/Volumes/workspaces/codex-desktop-orchestrator",
           updatedAt: Math.floor(Date.now() / 1000)
         }
       });
@@ -393,7 +695,7 @@ describe("codex app-server driver", () => {
         thread: {
           id: "thread-bound",
           name: "绑定线程",
-          cwd: "/Volumes/workspaces/qq-codex-bridge",
+          cwd: "/Volumes/workspaces/codex-desktop-orchestrator",
           updatedAt: Math.floor(Date.now() / 1000),
           gitInfo: {
             branch: "codex/weixin-multi-channel"
@@ -437,10 +739,10 @@ describe("codex app-server driver", () => {
 
     expect(state).toMatchObject({
       threadTitle: "绑定线程",
-      threadProjectName: "qq-codex-bridge",
+      threadProjectName: "codex-desktop-orchestrator",
       model: "gpt-5.4",
       reasoningEffort: "high",
-      workspace: "qq-codex-bridge",
+      workspace: "codex-desktop-orchestrator",
       branch: "codex/weixin-multi-channel",
       permissionMode: "on-request / workspace-write"
     });
@@ -466,7 +768,7 @@ describe("codex app-server driver", () => {
 
     logStderr("unexpected app-server stderr");
     expect(warnSpy).toHaveBeenCalledWith(
-      "[qq-codex-bridge] codex app-server stderr",
+      "[codex-desktop-orchestrator] codex app-server stderr",
       { text: "unexpected app-server stderr" }
     );
 

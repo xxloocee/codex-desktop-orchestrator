@@ -29,7 +29,7 @@ assignees: ""
 - 操作系统：
 - Node.js 版本：
 - `pnpm` 版本：
-- 是否已连接 Codex Desktop `9229`：
+- Codex app-server 是否可用；如启用旧 CDP 模式，是否已连接 `9229`：
 - STT 模式：
 
 ## 日志

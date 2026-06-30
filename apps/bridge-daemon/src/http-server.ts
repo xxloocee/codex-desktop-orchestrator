@@ -2,9 +2,12 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 
 type JsonRoute = {
   routePath: string;
-  dispatchPayload(payload: unknown): Promise<void>;
+  method?: "GET" | "POST" | "PUT";
+  dispatchPayload(payload: unknown): Promise<unknown>;
   onDispatchError?: (error: Error, payload: unknown) => void;
   allowOnlyLocal?: boolean;
+  requiredToken?: string | null;
+  respondWithJson?: boolean;
 };
 
 type JsonServerDeps = {
@@ -58,10 +61,17 @@ export function createBridgeHttpServer(routes: JsonRoute[]): Server {
 
 function createJsonServer(deps: JsonServerDeps): Server {
   return createServer(async (request, response) => {
-    const route = deps.routes.find((candidate) => candidate.routePath === request.url);
-    if (!route) {
+    const candidateRoutes = deps.routes.filter((candidate) => candidate.routePath === request.url);
+    if (candidateRoutes.length === 0) {
       response.statusCode = 404;
       response.end("not found");
+      return;
+    }
+
+    const route = candidateRoutes.find((candidate) => (candidate.method ?? "POST") === request.method);
+    if (!route) {
+      response.statusCode = 405;
+      response.end("method not allowed");
       return;
     }
 
@@ -71,24 +81,51 @@ function createJsonServer(deps: JsonServerDeps): Server {
       return;
     }
 
-    if (request.method !== "POST") {
-      response.statusCode = 405;
-      response.end("method not allowed");
+    const method = route.method ?? "POST";
+    if (route.requiredToken && !hasValidToken(request, route.requiredToken)) {
+      response.statusCode = 401;
+      response.end("unauthorized");
+      return;
+    }
+
+    if (method === "GET") {
+      try {
+        const result = await route.dispatchPayload(undefined);
+        writeJson(response, 200, result ?? {});
+      } catch (error) {
+        const normalized =
+          error instanceof Error ? error : new Error(typeof error === "string" ? error : "dispatch failed");
+        route.onDispatchError?.(normalized, undefined);
+        writeJson(response, 500, { error: normalized.message });
+      }
       return;
     }
 
     const chunks: Buffer[] = [];
-
     for await (const chunk of request) {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
 
     let payload: unknown;
     try {
-      payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const body = Buffer.concat(chunks).toString("utf8").trim();
+      payload = body ? JSON.parse(body) : {};
     } catch (error) {
       response.statusCode = 400;
       response.end(error instanceof Error ? error.message : "invalid request");
+      return;
+    }
+
+    if (route.respondWithJson) {
+      try {
+        const result = await route.dispatchPayload(payload);
+        writeJson(response, 200, result ?? {});
+      } catch (error) {
+        const normalized =
+          error instanceof Error ? error : new Error(typeof error === "string" ? error : "dispatch failed");
+        route.onDispatchError?.(normalized, payload);
+        writeJson(response, errorStatusCode(normalized), { error: normalized.message });
+      }
       return;
     }
 
@@ -103,6 +140,30 @@ function createJsonServer(deps: JsonServerDeps): Server {
     response.statusCode = 202;
     response.end("accepted");
   });
+}
+
+function hasValidToken(request: IncomingMessage, expectedToken: string): boolean {
+  const header = request.headers["x-qq-codex-token"] ?? request.headers.authorization;
+  const value = Array.isArray(header) ? header[0] : header;
+  if (!value) {
+    return false;
+  }
+
+  const token = value.startsWith("Bearer ") ? value.slice("Bearer ".length) : value;
+  return token === expectedToken;
+}
+
+function writeJson(response: { statusCode: number; setHeader?: (name: string, value: string) => void; end(body?: string): void }, statusCode: number, payload: unknown): void {
+  response.statusCode = statusCode;
+  response.setHeader?.("content-type", "application/json; charset=utf-8");
+  response.end(JSON.stringify(payload));
+}
+
+function errorStatusCode(error: Error): number {
+  const statusCode = (error as Error & { statusCode?: unknown }).statusCode;
+  return typeof statusCode === "number" && statusCode >= 400 && statusCode < 600
+    ? statusCode
+    : 500;
 }
 
 function isLocalRequest(request: IncomingMessage): boolean {

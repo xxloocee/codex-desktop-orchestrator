@@ -29,7 +29,7 @@ afterEach(() => {
 
 describe("weixin gateway cli", () => {
   it("prints the qr url exposed by login flow before waiting for confirmation", async () => {
-    const cwd = createTempDir("qq-codex-weixin-gateway-");
+    const cwd = createTempDir("codex-desktop-weixin-gateway-");
     fs.writeFileSync(path.join(cwd, ".env"), "WEIXIN_ENABLED=true\n");
     const env: NodeJS.ProcessEnv = {
       WEIXIN_ENABLED: "true",
@@ -83,7 +83,7 @@ describe("weixin gateway cli", () => {
   });
 
   it("ignores a bare double-dash forwarded by pnpm before weixin login args", async () => {
-    const cwd = createTempDir("qq-codex-weixin-gateway-");
+    const cwd = createTempDir("codex-desktop-weixin-gateway-");
     fs.writeFileSync(path.join(cwd, ".env"), "WEIXIN_ENABLED=true\n");
     const env: NodeJS.ProcessEnv = {
       WEIXIN_ENABLED: "true",
@@ -129,7 +129,7 @@ describe("weixin gateway cli", () => {
   });
 
   it("starts multiple weixin long-poll clients in one gateway service", async () => {
-    const cwd = createTempDir("qq-codex-weixin-gateway-");
+    const cwd = createTempDir("codex-desktop-weixin-gateway-");
     const env: NodeJS.ProcessEnv = {
       WEIXIN_ENABLED: "true",
       WEIXIN_GATEWAY_LISTEN_HOST: "127.0.0.1",

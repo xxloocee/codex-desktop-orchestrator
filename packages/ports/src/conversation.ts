@@ -6,15 +6,28 @@ export type ConversationRunOptions = {
   onTurnEvent?: (event: TurnEvent) => Promise<void>;
 };
 
+export type OpenSessionOptions = {
+  cwd?: string | null;
+};
+
 export interface DesktopDriverPort {
+  shutdown?(): Promise<void>;
   ensureAppReady(): Promise<void>;
   getControlState(binding?: DriverBinding | null): Promise<CodexControlState>;
   getQuotaSummary(): Promise<string | null>;
   switchModel(model: string): Promise<CodexControlState>;
-  openOrBindSession(sessionKey: string, binding: DriverBinding | null): Promise<DriverBinding>;
+  openOrBindSession(
+    sessionKey: string,
+    binding: DriverBinding | null,
+    options?: OpenSessionOptions
+  ): Promise<DriverBinding>;
   listRecentThreads(limit: number): Promise<CodexThreadSummary[]>;
   switchToThread(sessionKey: string, threadRef: string): Promise<DriverBinding>;
-  createThread(sessionKey: string, seedPrompt: string): Promise<DriverBinding>;
+  createThread(
+    sessionKey: string,
+    seedPrompt: string,
+    options?: OpenSessionOptions
+  ): Promise<DriverBinding>;
   sendUserMessage(binding: DriverBinding, message: InboundMessage): Promise<void>;
   collectAssistantReply(
     binding: DriverBinding,

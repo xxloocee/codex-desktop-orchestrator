@@ -7,6 +7,7 @@ import type { ConversationEntry, InboundMessage, OutboundDraft } from "../../../
 import type { DesktopDriverPort } from "../../../packages/ports/src/conversation.js";
 import type { QqEgressPort } from "../../../packages/ports/src/qq.js";
 import type { SessionStorePort, TranscriptStorePort } from "../../../packages/ports/src/store.js";
+import type { AppConfig } from "./config.js";
 
 type ThreadCommandHandlerDeps = {
   sessionStore: SessionStorePort;
@@ -16,6 +17,7 @@ type ThreadCommandHandlerDeps = {
   chatgptDesktopAvailable?: boolean;
   chatgptDriver?: ChatgptDesktopDriver;
   accountKeys?: string[];
+  projectAliases?: AppConfig["projectAliases"];
 };
 
 export class ThreadCommandHandler {
@@ -116,6 +118,16 @@ export class ThreadCommandHandler {
       if (text === "/accounts") {
         const session = await this.deps.sessionStore.getSession(message.sessionKey);
         await this.deliverControlReply(message, this.buildAccountsText(message, session));
+        return;
+      }
+
+      if (text === "/projects") {
+        await this.deliverControlReply(message, await this.buildProjectsText());
+        return;
+      }
+
+      if (text === "/aliases") {
+        await this.deliverControlReply(message, this.buildProjectAliasesText());
         return;
       }
 
@@ -269,6 +281,38 @@ export class ThreadCommandHandler {
         return;
       }
 
+      const projectNewMatch = text.match(/^\/new\s+(\S+)\s+([\s\S]+)$/);
+      if (projectNewMatch) {
+        const alias = projectNewMatch[1].trim();
+        const task = projectNewMatch[2].trim();
+        const project = this.resolveProjectAlias(alias);
+        if (!project) {
+          await this.deliverControlReply(message, this.buildUnknownProjectText(alias));
+          return;
+        }
+
+        const binding = await this.deps.desktopDriver.createThread(
+          message.sessionKey,
+          this.buildProjectThreadSeedPrompt(alias, project, task),
+          {
+            cwd: project.cwd
+          }
+        );
+        await this.deps.sessionStore.updateConversationProvider(message.sessionKey, "codex-desktop");
+        await this.deps.sessionStore.updateBinding(message.sessionKey, binding.codexThreadRef);
+        await this.deps.sessionStore.updateSkillContextKey(message.sessionKey, null);
+        await this.deliverControlReply(
+          message,
+          [
+            `Created Codex thread for project: ${project.label ?? alias}`,
+            `Alias: ${alias}`,
+            `cwd: ${project.cwd}`,
+            `Binding: ${binding.codexThreadRef ?? "unbound"}`
+          ].join("\n")
+        );
+        return;
+      }
+
       const forkMatch = text.match(/^(?:\/thread\s+fork|\/tf)\s+(.+)$/);
       if (forkMatch) {
         const title = forkMatch[1].trim();
@@ -345,9 +389,12 @@ export class ThreadCommandHandler {
       /^\/mu\s+.+$/.test(text) ||
       /^\/thread\s+new\s+.+$/.test(text) ||
       /^\/tn\s+.+$/.test(text) ||
+      /^\/new\s+\S+\s+[\s\S]+$/.test(text) ||
       /^\/thread\s+fork\s+.+$/.test(text) ||
       /^\/tf\s+.+$/.test(text) ||
       text === "/thread" ||
+      text === "/projects" ||
+      text === "/aliases" ||
       text === "/cgpt" ||
       text === "/cgpt threads" ||
       text === "/cgpt new" ||
@@ -601,6 +648,82 @@ export class ThreadCommandHandler {
     ].join("\n");
   }
 
+  private async buildProjectsText(): Promise<string> {
+    const threads = await this.deps.desktopDriver.listRecentThreads(200);
+    const projects = new Map<string, { count: number; latestThread: string; relativeTime: string | null }>();
+    for (const thread of threads) {
+      const name = thread.projectName?.trim();
+      if (!name) {
+        continue;
+      }
+      const existing = projects.get(name);
+      if (existing) {
+        existing.count += 1;
+        continue;
+      }
+      projects.set(name, {
+        count: 1,
+        latestThread: thread.title,
+        relativeTime: thread.relativeTime
+      });
+    }
+
+    const entries = [...projects.entries()].sort(([left], [right]) => left.localeCompare(right));
+    if (entries.length === 0) {
+      return [
+        "No Codex Desktop projects found in recent threads.",
+        "Use /threads to inspect the current Codex thread list.",
+        "Use /aliases to inspect configured cwd aliases for /new <alias> <task>."
+      ].join("\n");
+    }
+
+    return [
+      "Codex Desktop projects from recent threads:",
+      "",
+      "| Project | Threads | Latest thread | Activity |",
+      "| --- | ---: | --- | --- |",
+      ...entries.map(([projectName, project]) =>
+        `| ${escapeMarkdownCell(projectName)} | ${project.count} | ${escapeMarkdownCell(project.latestThread)} | ${escapeMarkdownCell(project.relativeTime ?? "-")} |`
+      ),
+      "",
+      "Note: /new <alias> <task> uses /aliases, not this recent-project display list."
+    ].join("\n");
+  }
+
+  private buildProjectAliasesText(): string {
+    const entries = Object.entries(this.deps.projectAliases ?? {}).sort(([left], [right]) =>
+      left.localeCompare(right)
+    );
+    if (entries.length === 0) {
+      return [
+        "No project aliases configured.",
+        "Configure projectAliases in runtime config or QQ_CODEX_PROJECT_ALIASES_JSON.",
+        "Then use /new <alias> <task> to create a Codex thread in that cwd."
+      ].join("\n");
+    }
+
+    return [
+      "Configured project aliases:",
+      "",
+      "| Alias | Label | cwd |",
+      "| --- | --- | --- |",
+      ...entries.map(([alias, project]) =>
+        `| ${escapeMarkdownCell(alias)} | ${escapeMarkdownCell(project.label ?? "-")} | ${escapeMarkdownCell(project.cwd)} |`
+      ),
+      "",
+      "Use /new <alias> <task> to create a Codex thread in the alias cwd."
+    ].join("\n");
+  }
+
+  private buildUnknownProjectText(alias: string): string {
+    const names = Object.keys(this.deps.projectAliases ?? {}).sort();
+    return [
+      `Unknown project alias: ${alias}`,
+      names.length > 0 ? `Available aliases: ${names.join(", ")}` : "No project aliases configured.",
+      "Use /aliases to inspect configured aliases."
+    ].join("\n");
+  }
+
   private formatModelReply(state: CodexControlState): string {
     return [
       `当前模型：${state.model ?? "未识别"}`,
@@ -651,6 +774,35 @@ export class ThreadCommandHandler {
       "请把上面的标题视为本线程主题。",
       "现在无需展开分析，只需理解上下文并等待我的下一条消息。"
     ].join("\n");
+  }
+
+  private buildProjectThreadSeedPrompt(
+    alias: string,
+    project: { cwd: string; label?: string },
+    task: string
+  ): string {
+    return [
+      `Project alias: ${alias}`,
+      `Project label: ${project.label ?? alias}`,
+      `Working directory: ${project.cwd}`,
+      "",
+      "Task:",
+      task,
+      "",
+      "Please treat the working directory above as the target project for this thread."
+    ].join("\n");
+  }
+
+  private resolveProjectAlias(alias: string): { cwd: string; label?: string } | null {
+    const aliases = this.deps.projectAliases ?? {};
+    const exact = aliases[alias];
+    if (exact) {
+      return exact;
+    }
+
+    const normalized = alias.toLowerCase();
+    const matched = Object.entries(aliases).find(([name]) => name.toLowerCase() === normalized);
+    return matched?.[1] ?? null;
   }
 
   private buildForkThreadSeedPrompt(title: string, entries: ConversationEntry[]): string {

@@ -122,7 +122,7 @@ export class QqGatewayClient implements QqIngressPort {
     });
 
     socket.on("error", (error) => {
-      console.error("[qq-codex-bridge] qq gateway socket error", { error });
+      console.error("[codex-desktop-orchestrator] qq gateway socket error", { error });
     });
 
     await this.waitForSocketOpen(socket);
@@ -163,7 +163,7 @@ export class QqGatewayClient implements QqIngressPort {
     try {
       payload = JSON.parse(rawPayload) as GatewayPayload;
     } catch (error) {
-      console.error("[qq-codex-bridge] qq gateway payload parse failed", { error, rawPayload });
+      console.error("[codex-desktop-orchestrator] qq gateway payload parse failed", { error, rawPayload });
       return;
     }
 
@@ -307,7 +307,7 @@ export class QqGatewayClient implements QqIngressPort {
     this.nextReconnectDelayMs = null;
 
     if (code === 4914 || code === 4915) {
-      console.error("[qq-codex-bridge] qq gateway terminated permanently", { code });
+      console.error("[codex-desktop-orchestrator] qq gateway terminated permanently", { code });
       this.started = false;
       return;
     }
@@ -338,7 +338,7 @@ export class QqGatewayClient implements QqIngressPort {
       this.reconnectTimer = null;
       this.reconnectAttempt += 1;
       void this.connect().catch((error) => {
-        console.error("[qq-codex-bridge] qq gateway reconnect failed", { error });
+        console.error("[codex-desktop-orchestrator] qq gateway reconnect failed", { error });
         this.scheduleReconnect(this.reconnectDelaysMs[
           Math.min(this.reconnectAttempt, this.reconnectDelaysMs.length - 1)
         ]);

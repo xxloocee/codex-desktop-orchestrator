@@ -7,11 +7,16 @@ import { buildPeerKey, buildSessionKey } from "../../packages/orchestrator/src/s
 import { createSqliteDatabase } from "../../packages/store/src/sqlite.js";
 import { SqliteSessionStore } from "../../packages/store/src/session-repo.js";
 import { SqliteTranscriptStore } from "../../packages/store/src/message-repo.js";
+import type { SqliteDatabase } from "../../packages/store/src/sqlite.js";
 
 describe("sqlite store", () => {
   const tempDirs: string[] = [];
+  const openDbs: SqliteDatabase[] = [];
 
   afterEach(() => {
+    while (openDbs.length > 0) {
+      openDbs.pop()?.close();
+    }
     while (tempDirs.length > 0) {
       const dir = tempDirs.pop();
       if (dir) {
@@ -21,9 +26,15 @@ describe("sqlite store", () => {
   });
 
   function createTempDbPath(): string {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "qq-codex-bridge-"));
+    const dir = mkdtempSync(path.join(os.tmpdir(), "codex-desktop-orchestrator-"));
     tempDirs.push(dir);
     return path.join(dir, "data", "bridge.sqlite");
+  }
+
+  function createTempDb(): SqliteDatabase {
+    const db = createSqliteDatabase(createTempDbPath());
+    openDbs.push(db);
+    return db;
   }
 
   function createDeferred<T>() {
@@ -39,8 +50,7 @@ describe("sqlite store", () => {
   }
 
   it("persists a session that can be read back as active", async () => {
-    const dbPath = createTempDbPath();
-    const db = createSqliteDatabase(dbPath);
+    const db = createTempDb();
     const sessionStore = new SqliteSessionStore(db);
 
     const sessionKey = buildSessionKey({
@@ -84,8 +94,7 @@ describe("sqlite store", () => {
   });
 
   it("persists and updates the latest codex turn id on the session", async () => {
-    const dbPath = createTempDbPath();
-    const db = createSqliteDatabase(dbPath);
+    const db = createTempDb();
     const sessionStore = new SqliteSessionStore(db);
 
     const sessionKey = buildSessionKey({
@@ -118,8 +127,7 @@ describe("sqlite store", () => {
   });
 
   it("records inbound messages and prevents duplicate digests", async () => {
-    const dbPath = createTempDbPath();
-    const db = createSqliteDatabase(dbPath);
+    const db = createTempDb();
     const transcriptStore = new SqliteTranscriptStore(db);
 
     await transcriptStore.recordInbound({
@@ -156,8 +164,7 @@ describe("sqlite store", () => {
   });
 
   it("serializes overlapping work for the same session key", async () => {
-    const dbPath = createTempDbPath();
-    const db = createSqliteDatabase(dbPath);
+    const db = createTempDb();
     const sessionStore = new SqliteSessionStore(db);
     const sessionKey = buildSessionKey({
       accountKey: "qqbot:default",
@@ -189,8 +196,7 @@ describe("sqlite store", () => {
   });
 
   it("replaces a stale in-db lock left behind by a previous process", async () => {
-    const dbPath = createTempDbPath();
-    const db = createSqliteDatabase(dbPath);
+    const db = createTempDb();
     const sessionStore = new SqliteSessionStore(db);
     const sessionKey = buildSessionKey({
       accountKey: "qqbot:default",

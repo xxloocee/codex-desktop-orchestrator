@@ -30,7 +30,8 @@ import type { DriverBinding } from "../../../packages/domain/src/driver.js";
 import { SqliteTranscriptStore } from "../../../packages/store/src/message-repo.js";
 import { SqliteSessionStore } from "../../../packages/store/src/session-repo.js";
 import { createSqliteDatabase } from "../../../packages/store/src/sqlite.js";
-import { loadConfigFromEnv } from "./config.js";
+import { loadConfig } from "./config.js";
+import { discoverCodexInstallations } from "./codex-discovery.js";
 import { ChatgptDesktopProvider } from "../../../packages/adapters/chatgpt-desktop/src/bridge-provider.js";
 import type { ChatgptDesktopDriver } from "../../../packages/adapters/chatgpt-desktop/src/driver.js";
 
@@ -59,13 +60,14 @@ function formatDraftForWeixin(draft: Parameters<typeof formatWeixinOutboundDraft
 }
 
 export function bootstrap() {
-  const config = loadConfigFromEnv(process.env);
+  const config = loadConfig(process.env);
   const db = createSqliteDatabase(config.databasePath);
   const sessionStore = new SqliteSessionStore(db);
   const transcriptStore = new SqliteTranscriptStore(db);
   const runtimeDir = path.dirname(config.databasePath);
   const useDomTransport = process.env.CODEX_DESKTOP_TRANSPORT === "dom";
   const forwardAppServerUiEvents = process.env.CODEX_APP_SERVER_FORWARD_UI_EVENTS === "1";
+  const codexInstallations = discoverCodexInstallations({ env: process.env });
   const cdpSession = new CdpSession({
     appName: config.codexDesktop.appName,
     remoteDebuggingPort: config.codexDesktop.remoteDebuggingPort
@@ -81,6 +83,8 @@ export function bootstrap() {
     useDomTransport
       ? legacyDomDriver
       : new CodexAppServerDriver({
+          defaultCwd: config.codexDesktop.cwd,
+          codexBinaryPath: codexInstallations.binaryPath,
           controlFallback: legacyDomDriver,
           notificationForwarder: forwardAppServerUiEvents
             ? new CodexDesktopAppUiNotificationForwarder(cdpSession)
@@ -156,7 +160,8 @@ export function bootstrap() {
           : null;
         const binding = await adapters.codexDesktop.openOrBindSession(
           message.sessionKey,
-          currentBinding
+          currentBinding,
+          ...(config.codexDesktop.cwd ? [{ cwd: config.codexDesktop.cwd }] : [])
         );
         const skillContextKey = shouldInjectQqbotSkillContext(message)
           ? `${binding.codexThreadRef ?? "unbound"}:qqbot-skill-v2`
@@ -326,7 +331,7 @@ async function postTurnEvent(port: number, event: TurnEvent): Promise<void> {
       body: JSON.stringify(event)
     });
   } catch (error) {
-    console.warn("[qq-codex-bridge] turn event callback failed", {
+    console.warn("[codex-desktop-orchestrator] turn event callback failed", {
       turnId: event.turnId,
       sessionKey: event.sessionKey,
       error: error instanceof Error ? error.message : String(error)
