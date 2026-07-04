@@ -7,17 +7,30 @@ import {
   type OutboundDraft,
   type TurnEvent
 } from "../../domain/src/message.js";
+import { BridgeTurnStatus } from "../../domain/src/turn.js";
 import { DesktopDriverError } from "../../domain/src/driver.js";
 import type { ConversationProviderPort } from "../../ports/src/conversation.js";
 import type { QqEgressPort } from "../../ports/src/qq.js";
-import type { SessionStorePort, TranscriptStorePort } from "../../ports/src/store.js";
+import type {
+  DeliveryJobStorePort,
+  SessionStorePort,
+  TranscriptStorePort,
+  TurnStorePort
+} from "../../ports/src/store.js";
+import {
+  markSynchronousDeliveryFailure,
+  markSynchronousDeliveryResult
+} from "./delivery-worker.js";
 
 type BridgeOrchestratorDeps = {
   sessionStore: SessionStorePort;
   transcriptStore: TranscriptStorePort;
+  turnStore?: TurnStorePort;
+  deliveryJobStore?: DeliveryJobStorePort;
   conversationProvider: ConversationProviderPort;
   qqEgress: QqEgressPort;
   draftFormatter?: (draft: OutboundDraft) => OutboundDraft;
+  turnTimeoutMs?: number;
 };
 
 type TurnState = {
@@ -36,10 +49,13 @@ export class BridgeOrchestrator {
     Array<{ fingerprint: string; receivedAtMs: number; messageId: string }>
   >();
   private readonly turnStates = new Map<string, TurnState>();
+  private readonly sessionTurnTails = new Map<string, Promise<void>>();
   private readonly draftFormatter: (draft: OutboundDraft) => OutboundDraft;
+  private readonly turnTimeoutMs: number;
 
   constructor(private readonly deps: BridgeOrchestratorDeps) {
     this.draftFormatter = deps.draftFormatter ?? ((draft) => draft);
+    this.turnTimeoutMs = deps.turnTimeoutMs ?? 10 * 60_000;
   }
 
   async handleInbound(message: InboundMessage): Promise<void> {
@@ -48,6 +64,7 @@ export class BridgeOrchestrator {
       return;
     }
 
+    let turnId: string | null = null;
     await this.deps.sessionStore.withSessionLock(message.sessionKey, async () => {
       const seenInsideLock = await this.deps.transcriptStore.hasInbound(message.messageId);
       if (seenInsideLock) {
@@ -86,74 +103,184 @@ export class BridgeOrchestrator {
       await this.deps.transcriptStore.recordInbound(message);
       this.rememberInbound(message);
 
-      try {
-        const deliveredDraftIds = new Set<string>();
-        const deliveryErrors: string[] = [];
-        const handleDraft = async (draft: OutboundDraft) => {
-          if (deliveredDraftIds.has(draft.draftId)) {
-            return;
+      turnId = randomUUID();
+      const turnStartedAt = new Date().toISOString();
+      await this.deps.turnStore?.createTurn({
+        turnId,
+        sessionKey: message.sessionKey,
+        codexThreadRef: existing?.codexThreadRef ?? null,
+        qqMessageId: message.messageId,
+        status: BridgeTurnStatus.Queued,
+        startedAt: turnStartedAt,
+        deadlineAt: null
+      });
+    });
+
+    if (!turnId) {
+      return;
+    }
+    const bridgeTurnId = turnId;
+
+    await this.runWithSessionTurnQueue(
+      message.sessionKey,
+      async () => {
+        await this.deps.turnStore?.updateStatus(bridgeTurnId, BridgeTurnStatus.Queued);
+        await this.deps.turnStore?.updateDeadline(bridgeTurnId, null);
+      },
+      async () => {
+        try {
+          if (await this.isTurnCancelled(bridgeTurnId)) {
+            throw new DesktopDriverError(
+              "Bridge turn was cancelled before start",
+              "turn_cancelled"
+            );
           }
-          deliveredDraftIds.add(draft.draftId);
-          if (draft.turnId) {
-            await this.deps.sessionStore.updateLastCodexTurnId(message.sessionKey, draft.turnId);
-          }
-          const formattedDraft = this.draftFormatter(draft);
-          if (isEmptyDraft(formattedDraft)) {
-            return;
-          }
-          await this.deps.transcriptStore.recordOutbound(formattedDraft);
-          try {
-            await this.deps.qqEgress.deliver(formattedDraft);
-            this.recordDeliveredDraft(formattedDraft);
-          } catch (error) {
-            const reason = error instanceof Error ? error.message : String(error);
-            deliveryErrors.push(`${formattedDraft.draftId}: ${reason}`);
-            console.warn("[codex-desktop-orchestrator] draft delivery failed", {
+          await this.deps.turnStore?.updateStatus(bridgeTurnId, BridgeTurnStatus.Running);
+          await this.deps.turnStore?.updateDeadline(
+            bridgeTurnId,
+            new Date(Date.now() + this.turnTimeoutMs).toISOString()
+          );
+          const deliveredDraftIds = new Set<string>();
+          const deliveryErrors: string[] = [];
+          let taskStartedDraftSent = false;
+          const handleDraft = async (draft: OutboundDraft) => {
+            if (await this.isTurnCancelled(bridgeTurnId)) {
+              return;
+            }
+            if (deliveredDraftIds.has(draft.draftId)) {
+              return;
+            }
+            deliveredDraftIds.add(draft.draftId);
+            if (draft.turnId) {
+              await this.deps.turnStore?.attachCodexTurn(bridgeTurnId, draft.turnId);
+              await this.deps.turnStore?.updateStatus(bridgeTurnId, BridgeTurnStatus.Streaming);
+              await this.deps.sessionStore.updateLastCodexTurnId(message.sessionKey, draft.turnId);
+            }
+            const formattedDraft = this.draftFormatter(draft);
+            const pendingDraft = this.filterAlreadyDeliveredDraft(formattedDraft);
+            if (isEmptyDraft(pendingDraft)) {
+              return;
+            }
+            await this.deps.transcriptStore.recordOutbound(pendingDraft);
+            try {
+              const delivery = await this.deps.qqEgress.deliver(pendingDraft);
+              await markSynchronousDeliveryResult(
+                this.deps.deliveryJobStore,
+                pendingDraft,
+                delivery
+              );
+              await this.deps.turnStore?.addDeliveredText(bridgeTurnId, pendingDraft.text.length);
+              this.recordDeliveredDraft(pendingDraft);
+            } catch (error) {
+              await markSynchronousDeliveryFailure(
+                this.deps.deliveryJobStore,
+                pendingDraft,
+                error
+              );
+              const reason = error instanceof Error ? error.message : String(error);
+              deliveryErrors.push(`${pendingDraft.draftId}: ${reason}`);
+              console.warn("[codex-desktop-orchestrator] draft delivery failed", {
+                sessionKey: message.sessionKey,
+                messageId: message.messageId,
+                draftId: pendingDraft.draftId,
+                error: reason
+              });
+            }
+          };
+          const deliverTaskStarted = async () => {
+            if (taskStartedDraftSent) {
+              return;
+            }
+            taskStartedDraftSent = true;
+            await handleDraft({
+              draftId: `task-started:${message.messageId}`,
               sessionKey: message.sessionKey,
-              messageId: message.messageId,
-              draftId: formattedDraft.draftId,
-              error: reason
+              text: "任务已开始。",
+              createdAt: new Date().toISOString(),
+              replyToMessageId: message.messageId
             });
+          };
+
+          const drafts = await this.deps.conversationProvider.runTurn(message, {
+            onQueued: async () => {
+              await this.deps.turnStore?.updateStatus(bridgeTurnId, BridgeTurnStatus.Queued);
+              await this.deps.turnStore?.updateDeadline(bridgeTurnId, null);
+            },
+            onStarted: async () => {
+              if (await this.isTurnCancelled(bridgeTurnId)) {
+                throw new DesktopDriverError(
+                  "Bridge turn was cancelled before start",
+                  "turn_cancelled"
+                );
+              }
+              await this.deps.turnStore?.updateStatus(bridgeTurnId, BridgeTurnStatus.Running);
+              await this.deps.turnStore?.updateDeadline(
+                bridgeTurnId,
+                new Date(Date.now() + this.turnTimeoutMs).toISOString()
+              );
+              await deliverTaskStarted();
+            },
+            onThreadBound: async (codexThreadRef) => {
+              await this.deps.turnStore?.updateCodexThreadRef(bridgeTurnId, codexThreadRef);
+            },
+            onDraft: handleDraft
+          });
+
+          for (const draft of drafts) {
+            await handleDraft(draft);
           }
-        };
 
-        const drafts = await this.deps.conversationProvider.runTurn(message, {
-          onDraft: handleDraft
-        });
-
-        for (const draft of drafts) {
-          await handleDraft(draft);
-        }
-
-        await this.deps.sessionStore.updateSessionStatus(
-          message.sessionKey,
-          BridgeSessionStatus.Active,
-          deliveryErrors.length > 0 ? deliveryErrors.at(-1) ?? null : null
-        );
-      } catch (error) {
-        const lastError = error instanceof Error ? error.message : String(error);
-        if (isRecoverableTurnError(error)) {
           await this.deps.sessionStore.updateSessionStatus(
             message.sessionKey,
             BridgeSessionStatus.Active,
+            deliveryErrors.length > 0 ? deliveryErrors.at(-1) ?? null : null
+          );
+          if (await this.isTurnCancelled(bridgeTurnId)) {
+            return;
+          }
+          await this.deps.turnStore?.updateStatus(
+            bridgeTurnId,
+            BridgeTurnStatus.Completed,
+            deliveryErrors.length > 0 ? deliveryErrors.at(-1) ?? null : null
+          );
+        } catch (error) {
+          const lastError = error instanceof Error ? error.message : String(error);
+          if (error instanceof DesktopDriverError && error.reason === "service_error") {
+            await this.deps.turnStore?.updateStatus(bridgeTurnId, BridgeTurnStatus.Failed, lastError);
+            await this.deps.sessionStore.updateSessionStatus(
+              message.sessionKey,
+              BridgeSessionStatus.Active,
+              lastError
+            );
+            throw error;
+          }
+
+          const recoverableStatus = getRecoverableTurnStatus(error);
+          if (recoverableStatus) {
+            await this.deps.turnStore?.updateStatus(bridgeTurnId, recoverableStatus, lastError);
+            await this.deps.sessionStore.updateSessionStatus(
+              message.sessionKey,
+              BridgeSessionStatus.Active,
+              lastError
+            );
+            console.warn("[codex-desktop-orchestrator] recoverable turn error", {
+              messageId: message.messageId,
+              sessionKey: message.sessionKey,
+              error: lastError
+            });
+            return;
+          }
+
+          await this.deps.turnStore?.updateStatus(bridgeTurnId, BridgeTurnStatus.Failed, lastError);
+          await this.deps.sessionStore.updateSessionStatus(
+            message.sessionKey,
+            BridgeSessionStatus.NeedsRebind,
             lastError
           );
-          console.warn("[codex-desktop-orchestrator] recoverable turn error", {
-            messageId: message.messageId,
-            sessionKey: message.sessionKey,
-            error: lastError
-          });
-          return;
+          throw error;
         }
-
-        await this.deps.sessionStore.updateSessionStatus(
-          message.sessionKey,
-          BridgeSessionStatus.NeedsRebind,
-          lastError
-        );
-        throw error;
       }
-    });
+    );
   }
 
   async handleTurnEvent(event: TurnEvent): Promise<void> {
@@ -163,10 +290,38 @@ export class BridgeOrchestrator {
         return;
       }
 
+      if (
+        await this.isCodexTurnCancelled(
+          event.sessionKey,
+          event.turnId,
+          event.payload.replyToMessageId ?? null
+        )
+      ) {
+        return;
+      }
+
+      const lastError = readTurnEventError(event);
+      const eventStatus = getTurnEventBridgeStatus(event, lastError);
+
       await this.deps.sessionStore.updateLastCodexTurnId(event.sessionKey, event.turnId);
+      await this.deps.turnStore?.recordTurnEvent({
+        sessionKey: event.sessionKey,
+        codexTurnRef: event.turnId,
+        qqMessageId: event.payload.replyToMessageId ?? null,
+        status: eventStatus,
+        eventAt: event.createdAt,
+        lastToolName: event.payload.toolName ?? null,
+        lastError
+      });
 
       state.lastSequence = event.sequence;
       state.lastEventAt = event.createdAt;
+      if (isTerminalTurnStatus(eventStatus) && eventStatus !== BridgeTurnStatus.Completed) {
+        state.completed = true;
+        state.finalFlushed = true;
+        return;
+      }
+
       if (typeof event.payload.fullText === "string") {
         state.assembledText = event.payload.fullText;
       } else if (typeof event.payload.text === "string" && event.payload.text.length > 0) {
@@ -212,7 +367,17 @@ export class BridgeOrchestrator {
       }
 
       await this.deps.transcriptStore.recordOutbound(normalizedDraft);
-      await this.deps.qqEgress.deliver(normalizedDraft);
+      try {
+        const delivery = await this.deps.qqEgress.deliver(normalizedDraft);
+        await markSynchronousDeliveryResult(
+          this.deps.deliveryJobStore,
+          normalizedDraft,
+          delivery
+        );
+      } catch (error) {
+        await markSynchronousDeliveryFailure(this.deps.deliveryJobStore, normalizedDraft, error);
+        throw error;
+      }
       this.recordDeliveredDraft(normalizedDraft);
       state.sentText = state.assembledText;
       state.completed = true;
@@ -312,10 +477,148 @@ export class BridgeOrchestrator {
     }
     this.turnStates.set(key, state);
   }
+
+  private filterAlreadyDeliveredDraft(draft: OutboundDraft): OutboundDraft {
+    if (!draft.turnId) {
+      return draft;
+    }
+
+    const state = this.turnStates.get(buildTurnStateKey(draft.sessionKey, draft.turnId));
+    if (!state?.finalFlushed) {
+      return draft;
+    }
+
+    const pendingText = computePendingTurnText(state.sentText, draft.text);
+    const pendingArtifacts = filterPendingArtifacts(draft.mediaArtifacts ?? [], state.sentArtifactKeys);
+    if (
+      pendingText === draft.text
+      && pendingArtifacts.length === (draft.mediaArtifacts?.length ?? 0)
+    ) {
+      return draft;
+    }
+
+    return {
+      ...draft,
+      text: pendingText,
+      mediaArtifacts: pendingArtifacts
+    };
+  }
+
+  private async isTurnCancelled(turnId: string): Promise<boolean> {
+    const turn = await this.deps.turnStore?.getTurn(turnId);
+    return turn?.status === BridgeTurnStatus.Cancelled;
+  }
+
+  private async isCodexTurnCancelled(
+    sessionKey: string,
+    codexTurnRef: string,
+    qqMessageId: string | null
+  ): Promise<boolean> {
+    const turn = await this.deps.turnStore?.getTurnByCodexTurn(
+      sessionKey,
+      codexTurnRef,
+      qqMessageId
+    );
+    return turn?.status === BridgeTurnStatus.Cancelled;
+  }
+
+  private async runWithSessionTurnQueue<T>(
+    sessionKey: string,
+    onQueued: (() => Promise<void>) | undefined,
+    work: () => Promise<T>
+  ): Promise<T> {
+    const isQueued = this.sessionTurnTails.has(sessionKey);
+    const previousTail = this.sessionTurnTails.get(sessionKey) ?? Promise.resolve();
+    let releaseCurrent!: () => void;
+    const currentTail = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
+    });
+    const queuedTail = previousTail.then(() => currentTail, () => currentTail);
+
+    this.sessionTurnTails.set(sessionKey, queuedTail);
+    if (isQueued) {
+      try {
+        await onQueued?.();
+      } catch (error) {
+        console.warn("[codex-desktop-orchestrator] session queue notice failed", {
+          sessionKey,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+
+    await previousTail;
+    try {
+      return await work();
+    } finally {
+      releaseCurrent();
+      if (this.sessionTurnTails.get(sessionKey) === queuedTail) {
+        this.sessionTurnTails.delete(sessionKey);
+      }
+    }
+  }
 }
 
-function isRecoverableTurnError(error: unknown): boolean {
-  return error instanceof DesktopDriverError && error.reason === "reply_timeout";
+function getRecoverableTurnStatus(error: unknown): BridgeTurnStatus | null {
+  if (!(error instanceof DesktopDriverError)) {
+    return null;
+  }
+
+  if (error.reason === "reply_timeout") {
+    return BridgeTurnStatus.TimedOut;
+  }
+
+  if (error.reason === "turn_cancelled") {
+    return BridgeTurnStatus.Cancelled;
+  }
+
+  return null;
+}
+
+function readTurnEventError(event: TurnEvent): string | null {
+  const status = event.payload.status?.trim();
+  if (!status || event.eventType !== TurnEventType.Completed) {
+    return null;
+  }
+
+  return status;
+}
+
+function getTurnEventBridgeStatus(event: TurnEvent, lastError: string | null): BridgeTurnStatus {
+  if (event.payload.toolStatus === "silence-timeout") {
+    return BridgeTurnStatus.TimedOut;
+  }
+
+  if (event.eventType === TurnEventType.Status && event.payload.toolStatus) {
+    return BridgeTurnStatus.ToolRunning;
+  }
+
+  if (event.eventType !== TurnEventType.Completed) {
+    return BridgeTurnStatus.Streaming;
+  }
+
+  if (!lastError) {
+    return BridgeTurnStatus.Completed;
+  }
+
+  if (/cancel|abort|interrupt/i.test(lastError)) {
+    return BridgeTurnStatus.Cancelled;
+  }
+
+  if (/timeout/i.test(lastError)) {
+    return BridgeTurnStatus.TimedOut;
+  }
+
+  return BridgeTurnStatus.Failed;
+}
+
+function isTerminalTurnStatus(status: BridgeTurnStatus): boolean {
+  return (
+    status === BridgeTurnStatus.Completed
+    || status === BridgeTurnStatus.Failed
+    || status === BridgeTurnStatus.TimedOut
+    || status === BridgeTurnStatus.Cancelled
+  );
 }
 
 function buildInboundFingerprint(message: InboundMessage): string {

@@ -1,7 +1,17 @@
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { DesktopDriverError } from "../../../packages/domain/src/driver.js";
-import type { InboundMessage, OutboundDraft, TurnEvent } from "../../../packages/domain/src/message.js";
+import type {
+  DeliveryRecord,
+  InboundMessage,
+  OutboundDraft,
+  TurnEvent
+} from "../../../packages/domain/src/message.js";
+import {
+  markSynchronousDeliveryFailure,
+  markSynchronousDeliveryResult
+} from "../../../packages/orchestrator/src/delivery-worker.js";
+import type { DeliveryJobStorePort, TranscriptStorePort } from "../../../packages/ports/src/store.js";
 import { authorizeInboundMessage, type AccessDecision } from "./access-control.js";
 import { bootstrap, INTERNAL_TURN_EVENT_PATH } from "./bootstrap.js";
 import { updateRuntimeConfigFile } from "./config-management.js";
@@ -26,8 +36,10 @@ type IngressMessageHandlerDeps = {
     handleInbound: (message: InboundMessage) => Promise<void>;
   };
   errorEgress?: {
-    deliver(draft: OutboundDraft): Promise<unknown>;
+    deliver(draft: OutboundDraft): Promise<DeliveryRecord>;
   };
+  transcriptStore?: Pick<TranscriptStorePort, "recordOutbound">;
+  deliveryJobStore?: DeliveryJobStorePort;
 };
 
 export function createIngressMessageHandler(deps: IngressMessageHandlerDeps) {
@@ -55,16 +67,19 @@ export function createIngressMessageHandler(deps: IngressMessageHandlerDeps) {
         console.error("  stack:", error.stack);
       }
       if (deps.errorEgress) {
+        const errorDraft: OutboundDraft = {
+          draftId: randomUUID(),
+          sessionKey: message.sessionKey,
+          text: buildBridgeErrorReplyText(error, errorMessage),
+          createdAt: new Date().toISOString(),
+          replyToMessageId: message.messageId
+        };
         try {
-          const errorDraft: OutboundDraft = {
-            draftId: randomUUID(),
-            sessionKey: message.sessionKey,
-            text: buildBridgeErrorReplyText(error, errorMessage),
-            createdAt: new Date().toISOString(),
-            replyToMessageId: message.messageId
-          };
-          await deps.errorEgress.deliver(errorDraft);
+          await deps.transcriptStore?.recordOutbound(errorDraft);
+          const delivery = await deps.errorEgress.deliver(errorDraft);
+          await markSynchronousDeliveryResult(deps.deliveryJobStore, errorDraft, delivery);
         } catch (replyError) {
+          await markSynchronousDeliveryFailure(deps.deliveryJobStore, errorDraft, replyError);
           console.warn("[codex-desktop-orchestrator] failed to send error reply", {
             replyError: replyError instanceof Error ? replyError.message : String(replyError)
           });
@@ -81,6 +96,12 @@ function buildBridgeErrorReplyText(error: unknown, errorMessage: string): string
       "Start a fresh thread with /tn <title>, or use /new <project-alias> <task>, then send the task again."
     ].join("\n");
   }
+  if (error instanceof DesktopDriverError && error.reason === "service_error") {
+    return [
+      "[bridge error] Codex rejected this message input.",
+      "The task ended without a model reply. Try sending the request again in plain text, or start a fresh thread with /tn <title>."
+    ].join("\n");
+  }
   return `[bridge error] ${errorMessage}`;
 }
 
@@ -93,6 +114,11 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
   const app = bootstrap();
   const paths = runtimePaths();
   const managementToken = ensureManagementToken(paths);
+  const recoveryReport = app.runtimeRecoveryStore.recoverAbandonedState();
+  appendRuntimeLog(
+    paths,
+    `recovery timedOutTurns=${recoveryReport.timedOutTurns} orphanedTurns=${recoveryReport.orphanedTurns} clearedSessionLocks=${recoveryReport.clearedSessionLocks} clearedThreadLocks=${recoveryReport.clearedThreadLocks} remainingActiveTurns=${recoveryReport.remainingActiveTurns}`
+  );
   const qqGatewayDisabled = process.env.QQ_CODEX_DISABLE_QQ_GATEWAY === "1"
     || process.env.QQ_CODEX_DISABLE_QQ_GATEWAY === "true";
   const managedServices: Array<Pick<WeixinGatewayServiceHandle, "shutdown">> = [];
@@ -106,6 +132,8 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     const threadCommandHandler = new ThreadCommandHandler({
       sessionStore: app.sessionStore,
       transcriptStore: app.transcriptStore,
+      turnStore: app.turnStore,
+      deliveryJobStore: app.deliveryJobStore,
       desktopDriver: app.adapters.codexDesktop,
       qqEgress: adapter.egress,
       chatgptDriver: app.chatgptDriver,
@@ -119,6 +147,8 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
         threadCommandHandler,
         orchestrator,
         errorEgress: adapter.egress,
+        transcriptStore: app.transcriptStore,
+        deliveryJobStore: app.deliveryJobStore,
         accessControl: app.config.accessControl,
         onRejected: logRejectedInbound
       })
@@ -132,6 +162,8 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     const threadCommandHandler = new ThreadCommandHandler({
       sessionStore: app.sessionStore,
       transcriptStore: app.transcriptStore,
+      turnStore: app.turnStore,
+      deliveryJobStore: app.deliveryJobStore,
       desktopDriver: app.adapters.codexDesktop,
       qqEgress: adapter.egress,
       chatgptDriver: app.chatgptDriver,
@@ -145,6 +177,8 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
         threadCommandHandler,
         orchestrator,
         errorEgress: adapter.egress,
+        transcriptStore: app.transcriptStore,
+        deliveryJobStore: app.deliveryJobStore,
         accessControl: app.config.accessControl,
         onRejected: logRejectedInbound
       })
@@ -242,6 +276,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     {
       routePath: INTERNAL_TURN_EVENT_PATH,
       allowOnlyLocal: true,
+      respondWithJson: true,
       dispatchPayload: async (payload) => {
         const event = payload as TurnEvent;
         await resolveTurnEventOrchestrator(event, app.orchestrators).handleTurnEvent(event);
@@ -315,6 +350,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
   for (const route of weixinRoutes) {
     channelSet.add(route.accountKey);
   }
+  app.deliveryWorker.start();
   const channels = [...channelSet];
   writeRuntimeState(paths, {
     pid: process.pid,
@@ -354,6 +390,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
           ),
           ...managedServices.map((service) => service.shutdown())
         ]);
+        await app.deliveryWorker.stop();
         await app.adapters.codexDesktop.shutdown?.();
         await new Promise<void>((resolve) => bridgeHttpServer.close(() => resolve()));
         app.db.close();

@@ -1,8 +1,4 @@
 import type { InboundMessage, MediaArtifact } from "../../domain/src/message.js";
-import {
-  buildQqbotSkillContext,
-  shouldInjectQqbotSkillContext
-} from "./qqbot-skill-context.js";
 
 export function buildCodexInboundText(
   message: InboundMessage,
@@ -20,10 +16,6 @@ export function buildCodexInboundText(
 
   if (attachmentContextArtifacts.length > 0) {
     hiddenContexts.push(buildHiddenAttachmentContext(attachmentContextArtifacts));
-  }
-
-  if ((options.includeSkillContext ?? true) && shouldInjectQqbotSkillContext(message)) {
-    hiddenContexts.push(wrapHiddenContext("QQBOT_RUNTIME_CONTEXT", buildQqbotSkillContext(message)));
   }
 
   if (hiddenContexts.length > 0) {

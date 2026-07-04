@@ -45,6 +45,13 @@ export enum TurnEventType {
   Completed = "turn.completed"
 }
 
+export type ToolEventStatus =
+  | "started"
+  | "output"
+  | "completed"
+  | "failed"
+  | "silence-timeout";
+
 export type TurnEventPayload = {
   text?: string;
   fullText?: string;
@@ -52,6 +59,9 @@ export type TurnEventPayload = {
   replyToMessageId?: string;
   status?: string;
   completionReason?: "stable" | "timeout_flush";
+  toolName?: string;
+  toolStatus?: ToolEventStatus;
+  summary?: string;
 };
 
 export type TurnEvent = {
@@ -69,6 +79,27 @@ export type DeliveryRecord = {
   sessionKey: string;
   providerMessageId: string | null;
   deliveredAt: string;
+};
+
+export enum DeliveryJobStatus {
+  Pending = "pending",
+  InFlight = "in-flight",
+  Delivered = "delivered",
+  Failed = "failed"
+}
+
+export type DeliveryJobRecord = {
+  jobId: string;
+  sessionKey: string;
+  status: DeliveryJobStatus;
+  attemptCount: number;
+  payload: OutboundDraft;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+  nextAttemptAt: string | null;
+  deliveredAt: string | null;
+  providerMessageId: string | null;
 };
 
 export type ConversationEntry = {

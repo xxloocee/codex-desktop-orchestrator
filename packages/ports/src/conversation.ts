@@ -4,6 +4,9 @@ import type { InboundMessage, OutboundDraft, TurnEvent } from "../../domain/src/
 export type ConversationRunOptions = {
   onDraft?: (draft: OutboundDraft) => Promise<void>;
   onTurnEvent?: (event: TurnEvent) => Promise<void>;
+  onQueued?: () => Promise<void>;
+  onStarted?: () => Promise<void>;
+  onThreadBound?: (codexThreadRef: string | null) => Promise<void>;
 };
 
 export type OpenSessionOptions = {
@@ -33,6 +36,7 @@ export interface DesktopDriverPort {
     binding: DriverBinding,
     options?: ConversationRunOptions
   ): Promise<OutboundDraft[]>;
+  interruptActiveTurn?(sessionKey: string): Promise<boolean>;
   markSessionBroken(sessionKey: string, reason: string): Promise<void>;
 }
 

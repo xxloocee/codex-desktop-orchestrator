@@ -5,6 +5,18 @@ import { createIngressMessageHandler } from "../../apps/bridge-daemon/src/main.j
 import { ThreadCommandHandler } from "../../apps/bridge-daemon/src/thread-command-handler.js";
 
 describe("bootstrap integration", () => {
+  function createDeferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+
+    return { promise, resolve, reject };
+  }
+
   it("builds the app container with orchestrator and adapters", () => {
     process.env.QQBOT_APP_ID = "app-id";
     process.env.QQBOT_CLIENT_SECRET = "secret";
@@ -50,6 +62,93 @@ describe("bootstrap integration", () => {
     } finally {
       app.db.close();
       delete process.env.QQBOTS_JSON;
+    }
+  });
+
+  it("serializes concurrent turns that target the same codex thread", async () => {
+    process.env.QQBOT_APP_ID = "app-id";
+    process.env.QQBOT_CLIENT_SECRET = "secret";
+    process.env.QQ_CODEX_DATABASE_PATH = ":memory:";
+    process.env.CODEX_REMOTE_DEBUGGING_PORT = "9229";
+
+    const app = bootstrap();
+    try {
+      const firstCollectEntered = createDeferred<void>();
+      const releaseFirstCollect = createDeferred<void>();
+      const sendCalls: string[] = [];
+      let collectCount = 0;
+
+      vi.spyOn(app.adapters.codexDesktop, "ensureAppReady").mockResolvedValue(undefined);
+      vi.spyOn(app.adapters.codexDesktop, "openOrBindSession").mockImplementation(async (sessionKey) => ({
+        sessionKey,
+        codexThreadRef: "codex-app-thread:shared-thread"
+      }));
+      vi.spyOn(app.adapters.codexDesktop, "sendUserMessage").mockImplementation(async (binding) => {
+        sendCalls.push(binding.sessionKey);
+      });
+      const deliveredTexts: string[] = [];
+      vi.spyOn(app.adapters.codexDesktop, "collectAssistantReply").mockImplementation(async (binding) => {
+        collectCount += 1;
+        if (collectCount === 1) {
+          firstCollectEntered.resolve();
+          await releaseFirstCollect.promise;
+        }
+        return [
+          {
+            draftId: `draft-${collectCount}`,
+            turnId: `turn-${collectCount}`,
+            sessionKey: binding.sessionKey,
+            text: `reply-${collectCount}`,
+            createdAt: "2026-07-01T11:05:00.000Z"
+          }
+        ];
+      });
+      vi.spyOn(app.adapters.qq.egress, "deliver").mockImplementation(async (draft) => {
+        deliveredTexts.push(draft.text);
+        return {
+          jobId: "job-1",
+          sessionKey: draft.sessionKey,
+          providerMessageId: null,
+          deliveredAt: "2026-07-01T11:05:00.000Z"
+        };
+      });
+
+      const first = app.orchestrator.handleInbound({
+        messageId: "msg-lock-1",
+        accountKey: "qqbot:default",
+        sessionKey: "qqbot:default::qq:c2c:user-1",
+        peerKey: "qq:c2c:user-1",
+        chatType: "c2c",
+        senderId: "user-1",
+        text: "first",
+        receivedAt: "2026-07-01T11:05:00.000Z"
+      });
+      const second = app.orchestrator.handleInbound({
+        messageId: "msg-lock-2",
+        accountKey: "qqbot:default",
+        sessionKey: "qqbot:default::qq:c2c:user-2",
+        peerKey: "qq:c2c:user-2",
+        chatType: "c2c",
+        senderId: "user-2",
+        text: "second",
+        receivedAt: "2026-07-01T11:05:01.000Z"
+      });
+
+      await firstCollectEntered.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(sendCalls).toEqual(["qqbot:default::qq:c2c:user-1"]);
+      expect(deliveredTexts).not.toContain("当前 Codex thread 正在执行另一个任务，本消息已排队。");
+
+      releaseFirstCollect.resolve();
+
+      await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+      expect(sendCalls).toEqual([
+        "qqbot:default::qq:c2c:user-1",
+        "qqbot:default::qq:c2c:user-2"
+      ]);
+    } finally {
+      app.db.close();
     }
   });
 
@@ -330,7 +429,7 @@ describe("bootstrap integration", () => {
           | undefined;
 
       expect(stored?.codexThreadRef).toBe("codex-app-thread:thread-b:bbb");
-      expect(stored?.skillContextKey).toBe("codex-app-thread:thread-b:bbb:qqbot-skill-v2");
+      expect(stored?.skillContextKey).toBeNull();
       expect(stored?.lastCodexTurnId).toBe("turn-after-switch");
     } finally {
       app.db.close();
@@ -483,7 +582,12 @@ describe("bootstrap integration", () => {
         receivedAt: "2026-04-15T03:20:59.000Z"
       });
 
-      expect(deliverSpy).toHaveBeenCalledTimes(1);
+      expect(deliverSpy).toHaveBeenCalledTimes(2);
+      expect(deliverSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: "任务已开始。"
+        })
+      );
       expect(deliverSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           text: "",
@@ -594,6 +698,7 @@ describe("bootstrap integration", () => {
       let activeTurns = 0;
       let maxConcurrentTurns = 0;
       const releaseQueue: Array<() => void> = [];
+      const deliveredTexts: string[] = [];
 
       vi.spyOn(app.adapters.codexDesktop, "sendUserMessage").mockImplementation(async () => {
         activeTurns += 1;
@@ -605,11 +710,14 @@ describe("bootstrap integration", () => {
       });
 
       vi.spyOn(app.adapters.codexDesktop, "collectAssistantReply").mockResolvedValue([]);
-      vi.spyOn(app.adapters.qq.egress, "deliver").mockResolvedValue({
-        jobId: "job-lock",
-        sessionKey: "qqbot:default::qq:c2c:session-a",
-        providerMessageId: null,
-        deliveredAt: "2026-04-19T14:00:00.000Z"
+      vi.spyOn(app.adapters.qq.egress, "deliver").mockImplementation(async (draft) => {
+        deliveredTexts.push(draft.text);
+        return {
+          jobId: "job-lock",
+          sessionKey: draft.sessionKey,
+          providerMessageId: null,
+          deliveredAt: "2026-04-19T14:00:00.000Z"
+        };
       });
 
       const turnA = app.orchestrator.handleInbound({
@@ -639,6 +747,8 @@ describe("bootstrap integration", () => {
       }
       expect(releaseQueue.length).toBe(1);
       expect(maxConcurrentTurns).toBe(1);
+      expect(deliveredTexts).toContain("任务已开始。");
+      expect(deliveredTexts).not.toContain("\u5f53\u524d Codex thread \u6b63\u5728\u6267\u884c\u53e6\u4e00\u4e2a\u4efb\u52a1\uff0c\u672c\u6d88\u606f\u5df2\u6392\u961f\u3002");
 
       releaseQueue.shift()?.();
       for (let attempt = 0; attempt < 50 && releaseQueue.length < 1; attempt += 1) {

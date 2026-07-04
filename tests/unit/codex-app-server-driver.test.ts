@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { CodexAppServerDriver } from "../../packages/adapters/codex-desktop/src/codex-app-server-driver.js";
+import { TurnEventType } from "../../packages/domain/src/message.js";
 
 class FakeAppServerSocket extends EventEmitter {
   readyState = 0;
@@ -40,6 +41,18 @@ class FakeAppServerSocket extends EventEmitter {
   notify(method: string, params: unknown): void {
     this.emit("message", JSON.stringify({ jsonrpc: "2.0", method, params }));
   }
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+
+  return { promise, resolve, reject };
 }
 
 describe("codex app-server driver", () => {
@@ -667,6 +680,721 @@ describe("codex app-server driver", () => {
         (message as { method?: string; params?: unknown }).method === "turn/interrupt"
       )
     ).toBe(true);
+  });
+
+  it("interrupts the active app-server turn for a session", async () => {
+    const socket = new FakeAppServerSocket();
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("turn/start", (message) => {
+      socket.respond(message.id, {
+        turn: {
+          id: "turn-target"
+        }
+      });
+    });
+    socket.onRequest("turn/interrupt", (message) => {
+      socket.respond(message.id, {});
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+    const binding = {
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    };
+
+    await driver.sendUserMessage(binding, {
+      messageId: "msg-1",
+      accountKey: "qqbot:default",
+      sessionKey: binding.sessionKey,
+      peerKey: "qq:c2c:user-1",
+      chatType: "c2c",
+      senderId: "user-1",
+      text: "hello",
+      receivedAt: "2026-04-21T14:30:00.000Z"
+    });
+
+    await expect(driver.interruptActiveTurn(binding.sessionKey)).resolves.toBe(true);
+    await expect(driver.collectAssistantReply(binding)).rejects.toThrow(
+      "Codex app-server turn was cancelled"
+    );
+
+    const interrupts = socket.sent.filter((message) =>
+      (message as { method?: string }).method === "turn/interrupt"
+    );
+    expect(interrupts).toHaveLength(1);
+  });
+
+  it("emits app-server turn events while collecting assistant reply", async () => {
+    const socket = new FakeAppServerSocket();
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("turn/start", (message) => {
+      socket.respond(message.id, {
+        turn: {
+          id: "turn-target"
+        }
+      });
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+    const binding = {
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    };
+
+    await driver.sendUserMessage(binding, {
+      messageId: "msg-1",
+      accountKey: "qqbot:default",
+      sessionKey: binding.sessionKey,
+      peerKey: "qq:c2c:user-1",
+      chatType: "c2c",
+      senderId: "user-1",
+      text: "hello",
+      receivedAt: "2026-04-21T14:30:00.000Z"
+    });
+
+    const events: unknown[] = [];
+    const finalDraftsPromise = driver.collectAssistantReply(binding, {
+      onTurnEvent: async (event) => {
+        events.push(event);
+      }
+    });
+
+    socket.notify("item/agentMessage/delta", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      itemId: "item-1",
+      delta: "hello"
+    });
+    socket.notify("item/completed", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      item: {
+        id: "item-1",
+        type: "agentMessage",
+        text: "hello world"
+      }
+    });
+    socket.notify("turn/completed", {
+      threadId: "thread-target",
+      turn: {
+        id: "turn-target",
+        status: "completed"
+      }
+    });
+
+    await expect(finalDraftsPromise).resolves.toMatchObject([
+      {
+        turnId: "turn-target",
+        text: "hello world"
+      }
+    ]);
+    expect(events).toMatchObject([
+      {
+        turnId: "turn-target",
+        eventType: TurnEventType.Delta,
+        payload: {
+          text: "hello"
+        }
+      },
+      {
+        turnId: "turn-target",
+        eventType: TurnEventType.Completed,
+        isFinal: true,
+        payload: {
+          fullText: "hello world",
+          completionReason: "stable"
+        }
+      }
+    ]);
+  });
+
+  it("buffers turn events that arrive before reply collection starts", async () => {
+    const socket = new FakeAppServerSocket();
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("turn/start", (message) => {
+      socket.respond(message.id, {
+        turn: {
+          id: "turn-target"
+        }
+      });
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+    const binding = {
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    };
+
+    await driver.sendUserMessage(binding, {
+      messageId: "msg-1",
+      accountKey: "qqbot:default",
+      sessionKey: binding.sessionKey,
+      peerKey: "qq:c2c:user-1",
+      chatType: "c2c",
+      senderId: "user-1",
+      text: "hello",
+      receivedAt: "2026-04-21T14:30:00.000Z"
+    });
+    socket.notify("item/agentMessage/delta", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      itemId: "item-1",
+      delta: "early"
+    });
+    socket.notify("item/completed", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      item: {
+        id: "item-1",
+        type: "agentMessage",
+        text: "early reply"
+      }
+    });
+    socket.notify("turn/completed", {
+      threadId: "thread-target",
+      turn: {
+        id: "turn-target",
+        status: "completed"
+      }
+    });
+
+    const events: unknown[] = [];
+    await expect(driver.collectAssistantReply(binding, {
+      onTurnEvent: async (event) => {
+        events.push(event);
+      }
+    })).resolves.toMatchObject([
+      {
+        turnId: "turn-target",
+        text: "early reply"
+      }
+    ]);
+    expect(events).toMatchObject([
+      {
+        eventType: TurnEventType.Delta,
+        payload: {
+          text: "early"
+        }
+      },
+      {
+        eventType: TurnEventType.Completed,
+        isFinal: true,
+        payload: {
+          fullText: "early reply"
+        }
+      }
+    ]);
+  });
+
+  it("times out while flushing buffered turn events", async () => {
+    vi.useFakeTimers();
+    try {
+      const socket = new FakeAppServerSocket();
+      socket.onRequest("initialize", (message) => {
+        socket.respond(message.id, {
+          userAgent: "fake",
+          codexHome: "/tmp/codex",
+          platformFamily: "unix",
+          platformOs: "macos"
+        });
+      });
+      socket.onRequest("thread/resume", (message) => {
+        socket.respond(message.id, {});
+      });
+      socket.onRequest("thread/read", (message) => {
+        socket.respond(message.id, {
+          thread: {
+            id: "thread-target",
+            turns: []
+          }
+        });
+      });
+      socket.onRequest("turn/start", (message) => {
+        socket.respond(message.id, {
+          turn: {
+            id: "turn-target"
+          }
+        });
+      });
+      socket.onRequest("turn/interrupt", (message) => {
+        socket.respond(message.id, {});
+      });
+
+      const driver = new CodexAppServerDriver({
+        appServerUrl: "ws://127.0.0.1:1",
+        createWebSocket: () => socket as never,
+        requestTimeoutMs: 1_000,
+        replyTimeoutMs: 50,
+        sleep: async () => undefined
+      });
+      const binding = {
+        sessionKey: "qqbot:default::qq:c2c:user-1",
+        codexThreadRef: "codex-app-thread:thread-target"
+      };
+
+      await driver.sendUserMessage(binding, {
+        messageId: "msg-1",
+        accountKey: "qqbot:default",
+        sessionKey: binding.sessionKey,
+        peerKey: "qq:c2c:user-1",
+        chatType: "c2c",
+        senderId: "user-1",
+        text: "hello",
+        receivedAt: "2026-04-21T14:30:00.000Z"
+      });
+      socket.notify("item/completed", {
+        threadId: "thread-target",
+        turnId: "turn-target",
+        item: {
+          id: "item-1",
+          type: "agentMessage",
+          text: "early reply"
+        }
+      });
+      socket.notify("turn/completed", {
+        threadId: "thread-target",
+        turn: {
+          id: "turn-target",
+          status: "completed"
+        }
+      });
+
+      const finalDraftsPromise = driver.collectAssistantReply(binding, {
+        onTurnEvent: async () => new Promise<void>(() => {})
+      });
+      const finalDraftsRejection = finalDraftsPromise.catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(50);
+
+      const error = await finalDraftsRejection;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "Codex app-server reply did not arrive before timeout"
+      );
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({
+          method: "turn/interrupt",
+          params: {
+            threadId: "thread-target",
+            turnId: "turn-target"
+          }
+        })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for a completed turn event callback before resolving the final draft", async () => {
+    const socket = new FakeAppServerSocket();
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("turn/start", (message) => {
+      socket.respond(message.id, {
+        turn: {
+          id: "turn-target"
+        }
+      });
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+    const binding = {
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    };
+    const completedEventCanFinish = createDeferred<void>();
+
+    await driver.sendUserMessage(binding, {
+      messageId: "msg-1",
+      accountKey: "qqbot:default",
+      sessionKey: binding.sessionKey,
+      peerKey: "qq:c2c:user-1",
+      chatType: "c2c",
+      senderId: "user-1",
+      text: "hello",
+      receivedAt: "2026-04-21T14:30:00.000Z"
+    });
+
+    let resolved = false;
+    const finalDraftsPromise = driver.collectAssistantReply(binding, {
+      onTurnEvent: async (event) => {
+        if (event.eventType === TurnEventType.Completed) {
+          await completedEventCanFinish.promise;
+        }
+      }
+    }).then((drafts) => {
+      resolved = true;
+      return drafts;
+    });
+
+    socket.notify("item/completed", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      item: {
+        id: "item-1",
+        type: "agentMessage",
+        text: "hello world"
+      }
+    });
+    socket.notify("turn/completed", {
+      threadId: "thread-target",
+      turn: {
+        id: "turn-target",
+        status: "completed"
+      }
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+
+    completedEventCanFinish.resolve();
+    await expect(finalDraftsPromise).resolves.toMatchObject([
+      {
+        turnId: "turn-target",
+        text: "hello world"
+      }
+    ]);
+    expect(resolved).toBe(true);
+  });
+
+  it("emits normalized tool events for non-agent app-server items", async () => {
+    const socket = new FakeAppServerSocket();
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("turn/start", (message) => {
+      socket.respond(message.id, {
+        turn: {
+          id: "turn-target"
+        }
+      });
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+    const binding = {
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    };
+
+    await driver.sendUserMessage(binding, {
+      messageId: "msg-1",
+      accountKey: "qqbot:default",
+      sessionKey: binding.sessionKey,
+      peerKey: "qq:c2c:user-1",
+      chatType: "c2c",
+      senderId: "user-1",
+      text: "run checks",
+      receivedAt: "2026-04-21T14:30:00.000Z"
+    });
+
+    const events: unknown[] = [];
+    const finalDraftsPromise = driver.collectAssistantReply(binding, {
+      onTurnEvent: async (event) => {
+        events.push(event);
+      }
+    });
+
+    socket.notify("item/started", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      item: {
+        id: "tool-1",
+        type: "toolCall",
+        title: "pnpm run check"
+      }
+    });
+    socket.notify("item/delta", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      itemId: "tool-1",
+      delta: "checking..."
+    });
+    socket.notify("item/completed", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      item: {
+        id: "tool-1",
+        type: "toolCall",
+        title: "pnpm run check",
+        text: "ok"
+      }
+    });
+    socket.notify("item/completed", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      item: {
+        id: "item-1",
+        type: "agentMessage",
+        text: "checks passed"
+      }
+    });
+    socket.notify("turn/completed", {
+      threadId: "thread-target",
+      turn: {
+        id: "turn-target",
+        status: "completed"
+      }
+    });
+
+    await expect(finalDraftsPromise).resolves.toMatchObject([
+      {
+        turnId: "turn-target",
+        text: "checks passed"
+      }
+    ]);
+    expect(events).toMatchObject([
+      {
+        eventType: TurnEventType.Status,
+        payload: {
+          toolName: "pnpm run check",
+          toolStatus: "started"
+        }
+      },
+      {
+        eventType: TurnEventType.Status,
+        payload: {
+          toolName: "pnpm run check",
+          toolStatus: "output",
+          summary: "checking..."
+        }
+      },
+      {
+        eventType: TurnEventType.Status,
+        payload: {
+          toolName: "pnpm run check",
+          toolStatus: "completed",
+          summary: "ok"
+        }
+      },
+      {
+        eventType: TurnEventType.Completed,
+        isFinal: true,
+        payload: {
+          fullText: "checks passed"
+        }
+      }
+    ]);
+  });
+
+  it("interrupts a turn when an active tool is silent past the configured timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const socket = new FakeAppServerSocket();
+      socket.onRequest("initialize", (message) => {
+        socket.respond(message.id, {
+          userAgent: "fake",
+          codexHome: "/tmp/codex",
+          platformFamily: "unix",
+          platformOs: "macos"
+        });
+      });
+      socket.onRequest("thread/resume", (message) => {
+        socket.respond(message.id, {});
+      });
+      socket.onRequest("thread/read", (message) => {
+        socket.respond(message.id, {
+          thread: {
+            id: "thread-target",
+            turns: []
+          }
+        });
+      });
+      socket.onRequest("turn/start", (message) => {
+        socket.respond(message.id, {
+          turn: {
+            id: "turn-target"
+          }
+        });
+      });
+      socket.onRequest("turn/interrupt", (message) => {
+        socket.respond(message.id, {});
+      });
+
+      const driver = new CodexAppServerDriver({
+        appServerUrl: "ws://127.0.0.1:1",
+        createWebSocket: () => socket as never,
+        requestTimeoutMs: 1_000,
+        replyTimeoutMs: 10_000,
+        toolSilenceTimeoutMs: 50,
+        sleep: async () => undefined
+      });
+      const binding = {
+        sessionKey: "qqbot:default::qq:c2c:user-1",
+        codexThreadRef: "codex-app-thread:thread-target"
+      };
+
+      await driver.sendUserMessage(binding, {
+        messageId: "msg-1",
+        accountKey: "qqbot:default",
+        sessionKey: binding.sessionKey,
+        peerKey: "qq:c2c:user-1",
+        chatType: "c2c",
+        senderId: "user-1",
+        text: "run checks",
+        receivedAt: "2026-04-21T14:30:00.000Z"
+      });
+
+      const events: unknown[] = [];
+      const finalDraftsPromise = driver.collectAssistantReply(binding, {
+        onTurnEvent: async (event) => {
+          events.push(event);
+        }
+      });
+      const finalDraftsRejection = finalDraftsPromise.catch((error: unknown) => error);
+
+      socket.notify("item/started", {
+        threadId: "thread-target",
+        turnId: "turn-target",
+        item: {
+          id: "tool-1",
+          type: "toolCall",
+          title: "pnpm run check"
+        }
+      });
+      await vi.advanceTimersByTimeAsync(50);
+
+      const error = await finalDraftsRejection;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/tool silence timeout/);
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({
+          method: "turn/interrupt",
+          params: {
+            threadId: "thread-target",
+            turnId: "turn-target"
+          }
+        })
+      );
+      expect(socket.sent.filter((message) =>
+        (message as { method?: string }).method === "turn/interrupt"
+      )).toHaveLength(1);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          eventType: TurnEventType.Completed,
+          isFinal: true,
+          payload: expect.objectContaining({
+            status: "tool silence timeout: pnpm run check",
+            toolName: "pnpm run check",
+            toolStatus: "silence-timeout"
+          })
+        })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reads status from the bound app-server thread instead of the latest thread", async () => {

@@ -1,17 +1,35 @@
 import { randomUUID } from "node:crypto";
 import { BridgeSessionStatus, type BridgeSession, type ConversationProviderKind } from "../../../packages/domain/src/session.js";
+import { BridgeTurnStatus, type BridgeTurnRecord } from "../../../packages/domain/src/turn.js";
 import type { ChatgptDesktopDriver } from "../../../packages/adapters/chatgpt-desktop/src/driver.js";
 import { ensureAppVisible } from "../../../packages/adapters/chatgpt-desktop/src/ax-client.js";
 import { DesktopDriverError, type CodexControlState } from "../../../packages/domain/src/driver.js";
-import type { ConversationEntry, InboundMessage, OutboundDraft } from "../../../packages/domain/src/message.js";
+import {
+  DeliveryJobStatus,
+  type ConversationEntry,
+  type DeliveryJobRecord,
+  type InboundMessage,
+  type OutboundDraft
+} from "../../../packages/domain/src/message.js";
 import type { DesktopDriverPort } from "../../../packages/ports/src/conversation.js";
 import type { QqEgressPort } from "../../../packages/ports/src/qq.js";
-import type { SessionStorePort, TranscriptStorePort } from "../../../packages/ports/src/store.js";
+import type {
+  DeliveryJobStorePort,
+  SessionStorePort,
+  TranscriptStorePort,
+  TurnStorePort
+} from "../../../packages/ports/src/store.js";
+import {
+  markSynchronousDeliveryFailure,
+  markSynchronousDeliveryResult
+} from "../../../packages/orchestrator/src/delivery-worker.js";
 import type { AppConfig } from "./config.js";
 
 type ThreadCommandHandlerDeps = {
   sessionStore: SessionStorePort;
   transcriptStore: TranscriptStorePort;
+  turnStore?: TurnStorePort;
+  deliveryJobStore?: DeliveryJobStorePort;
   desktopDriver: DesktopDriverPort;
   qqEgress: QqEgressPort;
   chatgptDesktopAvailable?: boolean;
@@ -31,10 +49,43 @@ export class ThreadCommandHandler {
     }
 
     const text = message.text.trim();
+    if (this.isCancelCommand(text)) {
+      const alreadySeen = await this.deps.transcriptStore.hasInbound(message.messageId);
+      if (alreadySeen) {
+        return true;
+      }
+
+      await this.deps.transcriptStore.recordInbound(message);
+      await this.handleCancelCommand(message, text);
+      return true;
+    }
+
     if (!text.startsWith("/")) {
       return false;
     }
     const supportedCommand = this.isSupportedCommand(text);
+
+    if (this.isTaskQueryCommand(text)) {
+      const alreadySeen = await this.deps.transcriptStore.hasInbound(message.messageId);
+      if (alreadySeen) {
+        return true;
+      }
+
+      await this.deps.transcriptStore.recordInbound(message);
+      await this.handleTaskQueryCommand(message, text);
+      return true;
+    }
+
+    if (this.isDeliveryQueryCommand(text)) {
+      const alreadySeen = await this.deps.transcriptStore.hasInbound(message.messageId);
+      if (alreadySeen) {
+        return true;
+      }
+
+      await this.deps.transcriptStore.recordInbound(message);
+      await this.handleDeliveryQueryCommand(message);
+      return true;
+    }
 
     const alreadySeen = await this.deps.transcriptStore.hasInbound(message.messageId);
     if (alreadySeen) {
@@ -377,6 +428,10 @@ export class ThreadCommandHandler {
       text === "/help" ||
       text === "/h" ||
       text === "/accounts" ||
+      text === "/tasks" ||
+      text === "/task current" ||
+      this.isCancelCommand(text) ||
+      this.isDeliveryQueryCommand(text) ||
       text === "/model" ||
       text === "/m" ||
       text === "/quota" ||
@@ -402,6 +457,28 @@ export class ThreadCommandHandler {
       text === "/source" ||
       /^\/source\s+(codex|chatgpt)$/.test(text)
     );
+  }
+
+  private isCancelCommand(text: string): boolean {
+    return (
+      text === "/cancel" ||
+      /^\/cancel\s+\S+$/.test(text) ||
+      /^(?:停止任务|取消任务|停止当前任务|取消当前任务)(?:\s+\S+)?$/.test(text)
+    );
+  }
+
+  private getCancelCommandTaskId(text: string): string | null {
+    return text.match(/^\/cancel\s+(\S+)$/)?.[1]
+      ?? text.match(/^(?:停止任务|取消任务|停止当前任务|取消当前任务)\s+(\S+)$/)?.[1]
+      ?? null;
+  }
+
+  private isTaskQueryCommand(text: string): boolean {
+    return text === "/task current" || text === "/tasks";
+  }
+
+  private isDeliveryQueryCommand(text: string): boolean {
+    return text === "/deliveries" || text === "/delivery jobs";
   }
 
   private formatThreads(
@@ -573,7 +650,13 @@ export class ThreadCommandHandler {
     };
 
     await this.deps.transcriptStore.recordOutbound(draft);
-    await this.deps.qqEgress.deliver(draft);
+    try {
+      const delivery = await this.deps.qqEgress.deliver(draft);
+      await markSynchronousDeliveryResult(this.deps.deliveryJobStore, draft, delivery);
+    } catch (error) {
+      await markSynchronousDeliveryFailure(this.deps.deliveryJobStore, draft, error);
+      throw error;
+    }
   }
 
   private buildHelpText(provider: ConversationProviderKind = "codex-desktop"): string {
@@ -645,6 +728,169 @@ export class ThreadCommandHandler {
       `| 当前会话 | ${escapeMarkdownCell(message.sessionKey)} |`,
       `| 当前对话源 | ${currentProvider} |`,
       `| 已接入账号 | ${accountKeys.map(escapeMarkdownCell).join(", ")} |`
+    ].join("\n");
+  }
+
+  private async buildCurrentTaskText(sessionKey: string): Promise<string> {
+    if (!this.deps.turnStore) {
+      return "Task tracking is not configured.";
+    }
+
+    const turn = await this.deps.turnStore.getCurrentTurn(sessionKey);
+    if (!turn) {
+      return "No active task for this conversation.";
+    }
+
+    return [
+      "Current task:",
+      this.formatTurnSummary(turn),
+      ...(turn.lastError ? [`Last error: ${turn.lastError}`] : []),
+      "",
+      "Use /tasks to see recent task history."
+    ].join("\n");
+  }
+
+  private async handleTaskQueryCommand(message: InboundMessage, text: string): Promise<void> {
+    await this.deliverControlReply(
+      message,
+      text === "/task current"
+        ? await this.buildCurrentTaskText(message.sessionKey)
+        : await this.buildTasksText(message.sessionKey)
+    );
+  }
+
+  private async handleDeliveryQueryCommand(message: InboundMessage): Promise<void> {
+    if (!this.deps.deliveryJobStore) {
+      await this.deliverControlReply(message, "Delivery queue is not configured.");
+      return;
+    }
+
+    const jobs = await this.deps.deliveryJobStore.listJobs({
+      sessionKey: message.sessionKey,
+      statuses: [
+        DeliveryJobStatus.Pending,
+        DeliveryJobStatus.InFlight,
+        DeliveryJobStatus.Failed
+      ],
+      limit: 10
+    });
+    await this.deliverControlReply(message, this.formatDeliveryJobs(jobs));
+  }
+
+  private async handleCancelCommand(message: InboundMessage, text: string): Promise<void> {
+    if (!this.deps.turnStore) {
+      await this.deliverControlReply(message, "Task tracking is not configured.");
+      return;
+    }
+
+    const current = await this.deps.turnStore.getCurrentTurn(message.sessionKey);
+    if (!current) {
+      await this.deliverControlReply(message, "No active task to cancel for this conversation.");
+      return;
+    }
+
+    const requestedTaskId = this.getCancelCommandTaskId(text);
+    if (requestedTaskId && !doesTurnIdMatchRequest(current.turnId, requestedTaskId)) {
+      await this.deliverControlReply(
+        message,
+        [
+          `No active task matches: ${requestedTaskId}`,
+          `Current task: ${current.turnId}`,
+          "Use /tasks to inspect recent task IDs."
+        ].join("\n")
+      );
+      return;
+    }
+
+    let interrupted = false;
+    let interruptError: string | null = null;
+    if (this.deps.desktopDriver.interruptActiveTurn) {
+      try {
+        interrupted = await this.deps.desktopDriver.interruptActiveTurn(message.sessionKey);
+      } catch (error) {
+        interruptError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    if (interruptError) {
+      await this.deps.turnStore.updateStatus(current.turnId, current.status, interruptError);
+      await this.deliverControlReply(
+        message,
+        [
+          `Cancel failed for task: ${current.turnId}`,
+          `Interrupt error: ${interruptError}`
+        ].join("\n")
+      );
+      return;
+    }
+
+    await this.deps.turnStore.updateStatus(
+      current.turnId,
+      BridgeTurnStatus.Cancelled,
+      null
+    );
+
+    await this.deliverControlReply(
+      message,
+      [
+        `Cancelled task: ${current.turnId}`,
+        interrupted
+          ? "Codex turn interrupt sent."
+          : "No active Codex turn was found in the driver; future output from this task will be suppressed.",
+        ...(interruptError ? [`Interrupt error: ${interruptError}`] : [])
+      ].join("\n")
+    );
+  }
+
+  private async buildTasksText(sessionKey: string): Promise<string> {
+    if (!this.deps.turnStore) {
+      return "Task tracking is not configured.";
+    }
+
+    const turns = await this.deps.turnStore.listRecentTurns(sessionKey, 10);
+    if (turns.length === 0) {
+      return "No task history for this conversation yet.";
+    }
+
+    return [
+      "Recent tasks:",
+      "",
+      "| Task | Status | Updated | Error |",
+      "| --- | --- | --- | --- |",
+      ...turns.map((turn) =>
+        `| ${escapeMarkdownCell(shortTurnId(turn.turnId))} | ${escapeMarkdownCell(turn.status)} | ${escapeMarkdownCell(formatRelativeTimestamp(turn.updatedAt))} | ${escapeMarkdownCell(turn.lastError ?? "-")} |`
+      )
+    ].join("\n");
+  }
+
+  private formatTurnSummary(turn: BridgeTurnRecord): string {
+    return [
+      `Task ID: ${turn.turnId}`,
+      `Status: ${turn.status}`,
+      `Message: ${turn.qqMessageId}`,
+      ...(turn.codexTurnRef ? [`Codex turn: ${turn.codexTurnRef}`] : []),
+      ...(turn.codexThreadRef ? [`Thread: ${turn.codexThreadRef}`] : []),
+      `Started: ${formatRelativeTimestamp(turn.startedAt)}`,
+      `Updated: ${formatRelativeTimestamp(turn.updatedAt)}`
+    ].join("\n");
+  }
+
+  private formatDeliveryJobs(jobs: DeliveryJobRecord[]): string {
+    if (jobs.length === 0) {
+      return "No pending or failed delivery jobs for this conversation.";
+    }
+
+    return [
+      "Delivery jobs:",
+      ...jobs.map((job) => [
+        `- ${job.jobId}`,
+        `  status: ${job.status}`,
+        `  attempts: ${job.attemptCount}`,
+        `  updated: ${formatRelativeTimestamp(job.updatedAt)}`,
+        job.nextAttemptAt ? `  next retry: ${formatRelativeTimestamp(job.nextAttemptAt)}` : null,
+        job.lastError ? `  error: ${job.lastError}` : null,
+        `  text: ${previewText(job.payload.text)}`
+      ].filter(Boolean).join("\n"))
     ].join("\n");
   }
 
@@ -856,4 +1102,60 @@ function normalizeChatgptTitle(value: string): string {
 
 function escapeMarkdownCell(value: string): string {
   return value.replace(/\|/g, "\\|").replace(/\n/g, " ").trim();
+}
+
+function previewText(value: string): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "-";
+  }
+
+  return normalized.length > 80 ? `${normalized.slice(0, 77)}...` : normalized;
+}
+
+function shortTurnId(turnId: string): string {
+  return turnId.length > 18 ? turnId.slice(0, 12) : turnId;
+}
+
+function doesTurnIdMatchRequest(turnId: string, requested: string): boolean {
+  if (turnId === requested || turnId.startsWith(requested)) {
+    return true;
+  }
+
+  const compactMatch = requested.match(/^(.+)\.\.\.(.+)$/);
+  return Boolean(
+    compactMatch
+    && turnId.startsWith(compactMatch[1])
+    && turnId.endsWith(compactMatch[2])
+  );
+}
+
+function formatRelativeTimestamp(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    return value;
+  }
+
+  const deltaMs = Date.now() - timestamp;
+  if (deltaMs < 0) {
+    return value;
+  }
+
+  const seconds = Math.floor(deltaMs / 1000);
+  if (seconds < 60) {
+    return `${seconds}s ago`;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h ago`;
+  }
+
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }

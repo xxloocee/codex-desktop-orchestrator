@@ -18,7 +18,6 @@ import { BridgeOrchestrator } from "../../../packages/orchestrator/src/bridge-or
 import { buildCodexInboundText } from "../../../packages/orchestrator/src/media-context.js";
 import { formatQqOutboundDraft } from "../../../packages/orchestrator/src/qq-outbound-format.js";
 import { enrichQqOutboundDraft } from "../../../packages/orchestrator/src/qq-outbound-draft.js";
-import { shouldInjectQqbotSkillContext } from "../../../packages/orchestrator/src/qqbot-skill-context.js";
 import { formatWeixinOutboundDraft } from "../../../packages/orchestrator/src/weixin-outbound-format.js";
 import type {
   ConversationProviderPort,
@@ -29,7 +28,12 @@ import type { ChatEgressPort } from "../../../packages/ports/src/chat.js";
 import type { DriverBinding } from "../../../packages/domain/src/driver.js";
 import { SqliteTranscriptStore } from "../../../packages/store/src/message-repo.js";
 import { SqliteSessionStore } from "../../../packages/store/src/session-repo.js";
+import { SqliteTurnStore } from "../../../packages/store/src/turn-repo.js";
+import { SqliteThreadLockStore } from "../../../packages/store/src/thread-lock-repo.js";
+import { SqliteDeliveryJobStore } from "../../../packages/store/src/delivery-job-repo.js";
+import { SqliteRuntimeRecoveryStore } from "../../../packages/store/src/runtime-recovery-repo.js";
 import { createSqliteDatabase } from "../../../packages/store/src/sqlite.js";
+import { DeliveryWorker } from "../../../packages/orchestrator/src/delivery-worker.js";
 import { loadConfig } from "./config.js";
 import { discoverCodexInstallations } from "./codex-discovery.js";
 import { ChatgptDesktopProvider } from "../../../packages/adapters/chatgpt-desktop/src/bridge-provider.js";
@@ -64,6 +68,10 @@ export function bootstrap() {
   const db = createSqliteDatabase(config.databasePath);
   const sessionStore = new SqliteSessionStore(db);
   const transcriptStore = new SqliteTranscriptStore(db);
+  const turnStore = new SqliteTurnStore(db);
+  const threadLockStore = new SqliteThreadLockStore(db);
+  const deliveryJobStore = new SqliteDeliveryJobStore(db);
+  const runtimeRecoveryStore = new SqliteRuntimeRecoveryStore(db);
   const runtimeDir = path.dirname(config.databasePath);
   const useDomTransport = process.env.CODEX_DESKTOP_TRANSPORT === "dom";
   const forwardAppServerUiEvents = process.env.CODEX_APP_SERVER_FORWARD_UI_EVENTS === "1";
@@ -124,31 +132,54 @@ export function bootstrap() {
     codexDesktop: codexDriver
   };
   let desktopTurnTail = Promise.resolve();
+  let desktopTurnPendingCount = 0;
 
-  const runWithDesktopTurnLock = async <T>(work: () => Promise<T>): Promise<T> => {
+  const runWithDesktopTurnLock = async <T>(
+    work: () => Promise<T>,
+    options?: { onQueued?: () => Promise<void> }
+  ): Promise<T> => {
+    const isQueued = desktopTurnPendingCount > 0;
     const previous = desktopTurnTail;
     let release!: () => void;
     desktopTurnTail = new Promise<void>((resolve) => {
       release = resolve;
     });
+    desktopTurnPendingCount += 1;
+
+    if (isQueued) {
+      try {
+        await options?.onQueued?.();
+      } catch (error) {
+        console.warn("[codex-desktop-orchestrator] desktop queue notice failed", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
 
     await previous;
     try {
       return await work();
     } finally {
       release();
+      desktopTurnPendingCount -= 1;
     }
   };
 
-  const runCodexTurn = async <T>(work: () => Promise<T>): Promise<T> =>
-    useDomTransport ? runWithDesktopTurnLock(work) : work();
+  const runCodexTurn = async <T>(
+    work: () => Promise<T>,
+    options?: { onQueued?: () => Promise<void> }
+  ): Promise<T> =>
+    useDomTransport ? runWithDesktopTurnLock(work, options) : work();
 
   const codexConversationProvider = {
     runTurn: async (
       message: Parameters<BridgeOrchestrator["handleInbound"]>[0],
       options?: ConversationRunOptions
     ) =>
-      runCodexTurn(async () => {
+    {
+      const notifyQueued = options?.onQueued;
+
+      return runCodexTurn(async () => {
         await adapters.codexDesktop.ensureAppReady();
         const session = await sessionStore.getSession(message.sessionKey);
         const currentBinding = session
@@ -163,52 +194,54 @@ export function bootstrap() {
           currentBinding,
           ...(config.codexDesktop.cwd ? [{ cwd: config.codexDesktop.cwd }] : [])
         );
-        const skillContextKey = shouldInjectQqbotSkillContext(message)
-          ? `${binding.codexThreadRef ?? "unbound"}:qqbot-skill-v2`
-          : null;
-        const shouldIncludeSkillContext =
-          skillContextKey !== null && session?.skillContextKey !== skillContextKey;
-        await adapters.codexDesktop.sendUserMessage(binding, {
-          ...message,
-          text: buildCodexInboundText(message, {
-            includeSkillContext: shouldIncludeSkillContext
-          })
-        });
-        const stableBinding = await resolveStableBinding(adapters.codexDesktop, binding);
-        if (session?.codexThreadRef !== stableBinding.codexThreadRef) {
-          await sessionStore.updateBinding(message.sessionKey, stableBinding.codexThreadRef);
-        }
-        if (shouldIncludeSkillContext) {
-          const stableSkillContextKey =
-            skillContextKey !== null
-              ? `${stableBinding.codexThreadRef ?? "unbound"}:qqbot-skill-v2`
-              : null;
-          await sessionStore.updateSkillContextKey(message.sessionKey, stableSkillContextKey);
-        }
-        const drafts = await adapters.codexDesktop.collectAssistantReply(stableBinding, {
-          onDraft: options?.onDraft
-            ? async (draft) => {
-                await options.onDraft!({
-                  ...draft,
-                  replyToMessageId: message.messageId
+        const threadRef = binding.codexThreadRef ?? message.sessionKey;
+        return threadLockStore.withThreadLock(
+          threadRef,
+          async () => {
+            await options?.onStarted?.();
+            await adapters.codexDesktop.sendUserMessage(binding, {
+              ...message,
+              text: buildCodexInboundText(message, {
+                includeSkillContext: false
+              })
+            });
+            const stableBinding = await resolveStableBinding(adapters.codexDesktop, binding);
+            if (session?.codexThreadRef !== stableBinding.codexThreadRef) {
+              await sessionStore.updateBinding(message.sessionKey, stableBinding.codexThreadRef);
+            }
+            await options?.onThreadBound?.(stableBinding.codexThreadRef);
+            const drafts = await adapters.codexDesktop.collectAssistantReply(stableBinding, {
+              onDraft: options?.onDraft
+                ? async (draft) => {
+                    await options.onDraft!({
+                      ...draft,
+                      replyToMessageId: message.messageId
+                    });
+                  }
+                : undefined,
+              onTurnEvent: async (event) => {
+                await postTurnEvent(config.runtime.listenPort, {
+                  ...event,
+                  payload: {
+                    ...event.payload,
+                    replyToMessageId: message.messageId
+                  }
                 });
               }
-            : undefined,
-          onTurnEvent: async (event) => {
-            await postTurnEvent(config.runtime.listenPort, {
-              ...event,
-              payload: {
-                ...event.payload,
-                replyToMessageId: message.messageId
-              }
             });
+            return drafts.map((draft) => ({
+              ...draft,
+              replyToMessageId: message.messageId
+            }));
+          },
+          {
+            onQueued: notifyQueued
           }
-        });
-        return drafts.map((draft) => ({
-          ...draft,
-          replyToMessageId: message.messageId
-        }));
-      })
+        );
+      }, {
+        onQueued: notifyQueued
+      });
+    }
   };
 
   const chatgptProvider = new ChatgptDesktopProvider({ outDir: "runtime/media/chatgpt" });
@@ -233,6 +266,8 @@ export function bootstrap() {
     new BridgeOrchestrator({
       sessionStore,
       transcriptStore,
+      turnStore,
+      deliveryJobStore,
       conversationProvider,
       qqEgress: egress,
       draftFormatter
@@ -287,11 +322,28 @@ export function bootstrap() {
     )
   };
 
+  const egressByAccountKey: Record<string, ChatEgressPort> = {
+    ...Object.fromEntries(qqAdapters.map((entry) => [entry.accountKey, entry.adapter.egress])),
+    ...Object.fromEntries(weixinAdapters.map((entry) => [entry.accountKey, entry.adapter.egress]))
+  };
+  const deliveryWorker = new DeliveryWorker({
+    store: deliveryJobStore,
+    resolveEgress: (draft) => {
+      const accountKey = accountKeyFromSessionKey(draft.sessionKey);
+      return accountKey ? egressByAccountKey[accountKey] ?? null : null;
+    }
+  });
+
   return {
     config,
     db,
     sessionStore,
     transcriptStore,
+    turnStore,
+    threadLockStore,
+    deliveryJobStore,
+    runtimeRecoveryStore,
+    deliveryWorker,
     adapters: allAdapters,
     orchestrator: channelOrchestrators.qq,
     orchestrators: channelOrchestrators,
@@ -343,4 +395,14 @@ export { INTERNAL_TURN_EVENT_PATH };
 
 function safePathSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, "_") || "default";
+}
+
+function accountKeyFromSessionKey(sessionKey: string): string | null {
+  const separatorIndex = sessionKey.indexOf("::");
+  if (separatorIndex < 0) {
+    return null;
+  }
+
+  const accountKey = sessionKey.slice(0, separatorIndex).trim();
+  return accountKey || null;
 }

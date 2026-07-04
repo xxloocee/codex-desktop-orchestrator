@@ -1,10 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { BridgeSessionStatus } from "../../packages/domain/src/session.js";
+import { BridgeTurnStatus } from "../../packages/domain/src/turn.js";
 import { DesktopDriverError } from "../../packages/domain/src/driver.js";
-import type { InboundMessage } from "../../packages/domain/src/message.js";
+import { DeliveryJobStatus, type InboundMessage } from "../../packages/domain/src/message.js";
 import type { DesktopDriverPort } from "../../packages/ports/src/conversation.js";
 import type { QqEgressPort } from "../../packages/ports/src/qq.js";
-import type { SessionStorePort, TranscriptStorePort } from "../../packages/ports/src/store.js";
+import type {
+  DeliveryJobStorePort,
+  SessionStorePort,
+  TranscriptStorePort,
+  TurnStorePort
+} from "../../packages/ports/src/store.js";
 import { ThreadCommandHandler } from "../../apps/bridge-daemon/src/thread-command-handler.js";
 
 vi.mock("../../packages/adapters/chatgpt-desktop/src/ax-client.js", () => ({
@@ -66,6 +72,81 @@ function createTranscriptStore(): TranscriptStorePort {
         direction: "outbound",
         text: "助手回答 1",
         createdAt: "2026-04-09T15:58:10.000Z"
+      }
+    ])
+  };
+}
+
+function createTurnStore(): TurnStorePort {
+  return {
+    createTurn: vi.fn().mockResolvedValue(undefined),
+    attachCodexTurn: vi.fn().mockResolvedValue(undefined),
+    updateCodexThreadRef: vi.fn().mockResolvedValue(undefined),
+    updateStatus: vi.fn().mockResolvedValue(undefined),
+    updateDeadline: vi.fn().mockResolvedValue(undefined),
+    recordTurnEvent: vi.fn().mockResolvedValue(undefined),
+    addDeliveredText: vi.fn().mockResolvedValue(undefined),
+    getTurn: vi.fn().mockResolvedValue(null),
+    getTurnByCodexTurn: vi.fn().mockResolvedValue(null),
+    getCurrentTurn: vi.fn().mockResolvedValue({
+      turnId: "bridge-turn-1",
+      sessionKey: "qqbot:default::qq:c2c:OPENID123",
+      codexThreadRef: "codex-app-thread:thread-1",
+      codexTurnRef: "codex-turn-1",
+      qqMessageId: "msg-1",
+      status: BridgeTurnStatus.Running,
+      startedAt: "2026-07-01T10:00:00.000Z",
+      updatedAt: new Date().toISOString(),
+      deadlineAt: null,
+      lastEventAt: null,
+      lastToolName: null,
+      lastError: null,
+      deliveredTextLength: 0
+    }),
+    listRecentTurns: vi.fn().mockResolvedValue([
+      {
+        turnId: "bridge-turn-1",
+        sessionKey: "qqbot:default::qq:c2c:OPENID123",
+        codexThreadRef: "codex-app-thread:thread-1",
+        codexTurnRef: "codex-turn-1",
+        qqMessageId: "msg-1",
+        status: BridgeTurnStatus.Completed,
+        startedAt: "2026-07-01T10:00:00.000Z",
+        updatedAt: new Date().toISOString(),
+        deadlineAt: null,
+        lastEventAt: "2026-07-01T10:00:10.000Z",
+        lastToolName: null,
+        lastError: null,
+        deliveredTextLength: 42
+      }
+    ])
+  };
+}
+
+function createDeliveryJobStore(): DeliveryJobStorePort {
+  return {
+    claimDueJobs: vi.fn().mockResolvedValue([]),
+    markDelivered: vi.fn().mockResolvedValue(undefined),
+    markAttemptFailed: vi.fn().mockResolvedValue(undefined),
+    recoverInFlight: vi.fn().mockResolvedValue(0),
+    listJobs: vi.fn().mockResolvedValue([
+      {
+        jobId: "draft-pending-1",
+        sessionKey: "qqbot:default::qq:c2c:OPENID123",
+        status: DeliveryJobStatus.Pending,
+        attemptCount: 1,
+        payload: {
+          draftId: "draft-pending-1",
+          sessionKey: "qqbot:default::qq:c2c:OPENID123",
+          text: "queued reply",
+          createdAt: "2026-07-01T10:00:00.000Z"
+        },
+        lastError: "network down",
+        createdAt: "2026-07-01T10:00:00.000Z",
+        updatedAt: "2026-07-01T10:00:05.000Z",
+        nextAttemptAt: "2026-07-01T10:01:05.000Z",
+        deliveredAt: null,
+        providerMessageId: null
       }
     ])
   };
@@ -449,6 +530,205 @@ describe("thread command handler", () => {
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
         text: expect.stringContaining("qqbot:shop")
+      })
+    );
+  });
+
+  it("shows the current tracked task for /task current", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver();
+    const qqEgress = createEgress();
+    const turnStore = createTurnStore();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      turnStore,
+      desktopDriver,
+      qqEgress
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/task current"))).resolves.toBe(true);
+
+    expect(turnStore.getCurrentTurn).toHaveBeenCalledWith("qqbot:default::qq:c2c:OPENID123");
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Current task:")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Status: running")
+      })
+    );
+  });
+
+  it("shows the current tracked task without waiting for the session lock", async () => {
+    const sessionStore = createSessionStore();
+    vi.mocked(sessionStore.withSessionLock).mockImplementation(async () => {
+      throw new Error("task query should bypass the session lock");
+    });
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver();
+    const qqEgress = createEgress();
+    const turnStore = createTurnStore();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      turnStore,
+      desktopDriver,
+      qqEgress
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/task current"))).resolves.toBe(true);
+
+    expect(sessionStore.withSessionLock).not.toHaveBeenCalled();
+    expect(turnStore.getCurrentTurn).toHaveBeenCalledWith("qqbot:default::qq:c2c:OPENID123");
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Current task:")
+      })
+    );
+  });
+
+  it("shows recent tracked tasks for /tasks", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver();
+    const qqEgress = createEgress();
+    const turnStore = createTurnStore();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      turnStore,
+      desktopDriver,
+      qqEgress
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/tasks"))).resolves.toBe(true);
+
+    expect(turnStore.listRecentTurns).toHaveBeenCalledWith("qqbot:default::qq:c2c:OPENID123", 10);
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Recent tasks:")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("| bridge-turn-1 | completed |")
+      })
+    );
+  });
+
+  it("shows pending and failed delivery jobs for /deliveries", async () => {
+    const deliveryJobStore = createDeliveryJobStore();
+    const transcriptStore = createTranscriptStore();
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore: createSessionStore(),
+      transcriptStore,
+      turnStore: createTurnStore(),
+      deliveryJobStore,
+      desktopDriver: createDriver(),
+      qqEgress
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/deliveries"))).resolves.toBe(true);
+
+    expect(deliveryJobStore.listJobs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: "qqbot:default::qq:c2c:OPENID123",
+        statuses: [
+          DeliveryJobStatus.Pending,
+          DeliveryJobStatus.InFlight,
+          DeliveryJobStatus.Failed
+        ]
+      })
+    );
+    expect(transcriptStore.recordInbound).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "/deliveries" })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Delivery jobs:")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("network down")
+      })
+    );
+  });
+
+  it.each(["/cancel", "停止任务", "取消任务", "停止当前任务", "取消当前任务"])(
+    "cancels the active task without waiting for the session lock: %s",
+    async (command) => {
+      const sessionStore = createSessionStore();
+      vi.mocked(sessionStore.withSessionLock).mockImplementation(async () => {
+        throw new Error("cancel should bypass the session lock");
+      });
+      const transcriptStore = createTranscriptStore();
+      const desktopDriver = createDriver({
+        interruptActiveTurn: vi.fn().mockResolvedValue(true)
+      });
+      const qqEgress = createEgress();
+      const turnStore = createTurnStore();
+      const handler = new ThreadCommandHandler({
+        sessionStore,
+        transcriptStore,
+        turnStore,
+        desktopDriver,
+        qqEgress
+      });
+
+      await expect(handler.handleIfCommand(createPrivateMessage(command))).resolves.toBe(true);
+
+      expect(sessionStore.withSessionLock).not.toHaveBeenCalled();
+      expect(transcriptStore.recordInbound).toHaveBeenCalledWith(
+        expect.objectContaining({ text: command })
+      );
+      expect(desktopDriver.interruptActiveTurn).toHaveBeenCalledWith(
+        "qqbot:default::qq:c2c:OPENID123"
+      );
+      expect(turnStore.updateStatus).toHaveBeenCalledWith(
+        "bridge-turn-1",
+        BridgeTurnStatus.Cancelled,
+        null
+      );
+      expect(qqEgress.deliver).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.stringContaining("Codex turn interrupt sent.")
+        })
+      );
+    }
+  );
+
+  it("keeps the task active when the driver interrupt fails", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver({
+      interruptActiveTurn: vi.fn().mockRejectedValue(new Error("interrupt failed"))
+    });
+    const qqEgress = createEgress();
+    const turnStore = createTurnStore();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      turnStore,
+      desktopDriver,
+      qqEgress
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/cancel"))).resolves.toBe(true);
+
+    expect(turnStore.updateStatus).toHaveBeenCalledWith(
+      "bridge-turn-1",
+      BridgeTurnStatus.Running,
+      "interrupt failed"
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Cancel failed for task")
       })
     );
   });

@@ -32,10 +32,17 @@ export class SqliteTranscriptStore implements TranscriptStorePort {
     this.db
       .prepare(
         `INSERT OR IGNORE INTO delivery_jobs (
-          job_id, session_key, status, attempt_count, payload_json, last_error, created_at, updated_at
-        ) VALUES (?, ?, 'pending', 0, ?, NULL, ?, ?)`
+          job_id, session_key, status, attempt_count, payload_json, last_error,
+          created_at, updated_at, next_attempt_at, delivered_at, provider_message_id
+        ) VALUES (?, ?, 'in-flight', 1, ?, NULL, ?, ?, NULL, NULL, NULL)`
       )
-      .run(draft.draftId, draft.sessionKey, JSON.stringify(draft), draft.createdAt, draft.createdAt);
+      .run(
+        draft.draftId,
+        draft.sessionKey,
+        JSON.stringify(draft),
+        draft.createdAt,
+        draft.createdAt
+      );
   }
 
   async hasInbound(messageId: string): Promise<boolean> {
@@ -56,12 +63,13 @@ export class SqliteTranscriptStore implements TranscriptStorePort {
 
            UNION ALL
 
-           SELECT 'outbound' AS direction,
-                  json_extract(payload_json, '$.text') AS text,
-                  created_at
-           FROM delivery_jobs
-           WHERE session_key = ?
-         )
+            SELECT 'outbound' AS direction,
+                   json_extract(payload_json, '$.text') AS text,
+                   created_at
+            FROM delivery_jobs
+            WHERE session_key = ?
+              AND status = 'delivered'
+          )
          WHERE text IS NOT NULL AND text != ''
          ORDER BY createdAt DESC
          LIMIT ?`

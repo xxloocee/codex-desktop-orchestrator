@@ -12,7 +12,10 @@ import {
 } from "../../../domain/src/driver.js";
 import {
   type InboundMessage,
-  type OutboundDraft
+  type OutboundDraft,
+  TurnEventType,
+  type ToolEventStatus,
+  type TurnEvent
 } from "../../../domain/src/message.js";
 import type {
   ConversationRunOptions,
@@ -93,15 +96,37 @@ type AgentDeltaParams = {
   delta?: string;
 };
 
+type AppServerItem = {
+  type?: string;
+  id?: string;
+  text?: string;
+  phase?: string | null;
+  name?: string | null;
+  title?: string | null;
+  command?: string | null;
+  status?: string | null;
+  output?: string | null;
+  error?: unknown;
+};
+
+type ItemStartedParams = {
+  threadId?: string;
+  turnId?: string;
+  item?: AppServerItem;
+};
+
+type ItemDeltaParams = {
+  threadId?: string;
+  turnId?: string;
+  itemId?: string;
+  delta?: string;
+  item?: AppServerItem;
+};
+
 type ItemCompletedParams = {
   threadId?: string;
   turnId?: string;
-  item?: {
-    type?: string;
-    id?: string;
-    text?: string;
-    phase?: string | null;
-  };
+  item?: AppServerItem;
 };
 
 type TurnCompletedParams = {
@@ -121,10 +146,23 @@ type PendingTurn = {
   failedReason: string | null;
   finalText: string;
   itemTexts: Map<string, string>;
+  toolItems: Map<string, ToolItemState>;
+  activeToolItemIds: Set<string>;
+  toolSilenceTimer: NodeJS.Timeout | null;
   mediaReferences: string[];
+  eventSequence: number;
+  onTurnEvent: ((event: TurnEvent) => Promise<void>) | null;
+  bufferedTurnEvents: TurnEvent[] | null;
   resolve: (result: AppServerTurnResult) => void;
   reject: (error: Error) => void;
   promise: Promise<AppServerTurnResult>;
+};
+
+type ToolItemState = {
+  id: string;
+  type: string | null;
+  name: string;
+  output: string;
 };
 
 type AppServerTurnResult = {
@@ -140,6 +178,7 @@ type CodexAppServerDriverOptions = {
   replyTimeoutMs?: number;
   requestTimeoutMs?: number;
   staleTurnInterruptMs?: number;
+  toolSilenceTimeoutMs?: number;
   defaultCwd?: string | null;
   sleep?: (ms: number) => Promise<void>;
   createWebSocket?: (url: string) => CodexAppServerSocket;
@@ -157,6 +196,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
   private readonly replyTimeoutMs: number;
   private readonly requestTimeoutMs: number;
   private readonly staleTurnInterruptMs: number;
+  private readonly toolSilenceTimeoutMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly createWebSocket: (url: string) => CodexAppServerSocket;
   private readonly controlFallback: CodexAppServerDriverOptions["controlFallback"];
@@ -198,6 +238,10 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     this.replyTimeoutMs = options.replyTimeoutMs ?? 10 * 60_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.staleTurnInterruptMs = options.staleTurnInterruptMs ?? this.replyTimeoutMs;
+    this.toolSilenceTimeoutMs =
+      options.toolSilenceTimeoutMs
+      ?? parseOptionalPositiveInteger(process.env.CODEX_TOOL_SILENCE_TIMEOUT_MS)
+      ?? 0;
     this.sleep =
       options.sleep ??
       ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -225,6 +269,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     this.pendingRequests.clear();
 
     for (const pending of this.pendingTurnsBySession.values()) {
+      this.clearToolSilenceTimer(pending);
       pending.reject(new DesktopDriverError("Codex app-server driver is shutting down", "reply_timeout"));
     }
     this.pendingTurnsBySession.clear();
@@ -449,18 +494,25 @@ export class CodexAppServerDriver implements DesktopDriverPort {
         "reply_timeout"
       );
     }
+    pending.onTurnEvent = options.onTurnEvent ?? null;
 
     let result: AppServerTurnResult;
     try {
       result = await withTimeout(
-        pending.promise,
+        (async () => {
+          await this.flushBufferedTurnEvents(pending);
+          return pending.promise;
+        })(),
         this.replyTimeoutMs,
         "Codex app-server reply did not arrive before timeout"
       );
     } catch (error) {
-      await this.interruptTurn(pending.threadId, pending.turnId).catch(() => undefined);
+      if (!(error instanceof DesktopDriverError && error.reason === "turn_cancelled")) {
+        await this.interruptTurn(pending.threadId, pending.turnId).catch(() => undefined);
+      }
       throw error;
     } finally {
+      this.clearToolSilenceTimer(pending);
       this.pendingTurnsBySession.delete(binding.sessionKey);
       this.pendingTurnsByKey.delete(buildTurnKey(pending.threadId, pending.turnId));
     }
@@ -478,6 +530,21 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     }
 
     return [draft];
+  }
+
+  async interruptActiveTurn(sessionKey: string): Promise<boolean> {
+    await this.ensureConnected();
+    const pending = this.pendingTurnsBySession.get(sessionKey);
+    if (!pending) {
+      return false;
+    }
+
+    await this.interruptTurn(pending.threadId, pending.turnId);
+    this.clearToolSilenceTimer(pending);
+    pending.reject(
+      new DesktopDriverError("Codex app-server turn was cancelled", "turn_cancelled")
+    );
+    return true;
   }
 
   async markSessionBroken(_sessionKey: string, _reason: string): Promise<void> {
@@ -718,13 +785,27 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       return;
     }
 
+    if (method === "item/started") {
+      this.handleItemStarted(params as ItemStartedParams);
+      return;
+    }
+
+    if (method === "item/delta") {
+      this.handleItemDelta(params as ItemDeltaParams);
+      return;
+    }
+
     if (method === "item/completed") {
       this.handleItemCompleted(params as ItemCompletedParams);
       return;
     }
 
     if (method === "turn/completed") {
-      this.handleTurnCompleted(params as TurnCompletedParams);
+      void this.handleTurnCompleted(params as TurnCompletedParams).catch((error) => {
+        console.warn("[codex-desktop-orchestrator] turn completion handling failed", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
     }
   }
 
@@ -738,12 +819,59 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       params.itemId,
       `${pending.itemTexts.get(params.itemId) ?? ""}${params.delta}`
     );
+    void this.emitTurnEvent(pending, TurnEventType.Delta, {
+      text: params.delta
+    });
+  }
+
+  private handleItemStarted(params: ItemStartedParams): void {
+    const pending = this.findPendingTurn(params.threadId, params.turnId);
+    const item = params.item;
+    if (!pending || !item?.id || isAgentMessageItem(item)) {
+      return;
+    }
+
+    const tool = this.upsertToolItem(pending, item);
+    pending.activeToolItemIds.add(tool.id);
+    this.refreshToolSilenceTimer(pending);
+    this.emitToolEvent(pending, "started", tool, summarizeToolItem(item));
+  }
+
+  private handleItemDelta(params: ItemDeltaParams): void {
+    const pending = this.findPendingTurn(params.threadId, params.turnId);
+    if (!pending || !params.itemId || typeof params.delta !== "string") {
+      return;
+    }
+
+    if (params.item && isAgentMessageItem(params.item)) {
+      return;
+    }
+
+    const knownTool = pending.toolItems.get(params.itemId);
+    if (!knownTool && params.item?.type && isAgentMessageType(params.item.type)) {
+      return;
+    }
+
+    const tool = knownTool
+      ?? this.upsertToolItem(pending, {
+        ...(params.item ?? {}),
+        id: params.itemId
+      });
+    tool.output += params.delta;
+    pending.activeToolItemIds.add(tool.id);
+    this.refreshToolSilenceTimer(pending);
+    this.emitToolEvent(pending, "output", tool, truncateSummary(params.delta));
   }
 
   private handleItemCompleted(params: ItemCompletedParams): void {
     const pending = this.findPendingTurn(params.threadId, params.turnId);
     const item = params.item;
-    if (!pending || !item?.id || item.type !== "agentMessage") {
+    if (!pending || !item?.id) {
+      return;
+    }
+
+    if (!isAgentMessageItem(item)) {
+      this.handleToolItemCompleted(pending, item);
       return;
     }
 
@@ -756,7 +884,16 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     pending.mediaReferences = extractMediaReferences(text);
   }
 
-  private handleTurnCompleted(params: TurnCompletedParams): void {
+  private handleToolItemCompleted(pending: PendingTurn, item: AppServerItem): void {
+    const tool = this.upsertToolItem(pending, item);
+    const summary = summarizeToolItem(item) || truncateSummary(tool.output);
+    const status = isFailedToolItem(item) ? "failed" : "completed";
+    pending.activeToolItemIds.delete(tool.id);
+    this.refreshToolSilenceTimer(pending);
+    this.emitToolEvent(pending, status, tool, summary);
+  }
+
+  private async handleTurnCompleted(params: TurnCompletedParams): Promise<void> {
     const turnId = params.turn?.id;
     const pending = this.findPendingTurn(params.threadId, turnId);
     if (!pending || !turnId) {
@@ -766,6 +903,15 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     if (params.turn?.status && params.turn.status !== "completed") {
       pending.completed = true;
       pending.failedReason = JSON.stringify(params.turn.error ?? params.turn.status);
+      this.clearToolSilenceTimer(pending);
+      await this.emitTurnEvent(
+        pending,
+        TurnEventType.Completed,
+        {
+          status: pending.failedReason
+        },
+        true
+      );
       pending.reject(
         new DesktopDriverError(
           `Codex app-server turn failed: ${pending.failedReason}`,
@@ -777,6 +923,17 @@ export class CodexAppServerDriver implements DesktopDriverPort {
 
     const finalText = pending.finalText || getLastMapValue(pending.itemTexts).trim();
     pending.completed = true;
+    this.clearToolSilenceTimer(pending);
+    await this.emitTurnEvent(
+      pending,
+      TurnEventType.Completed,
+      {
+        fullText: finalText,
+        mediaReferences: extractMediaReferences(finalText),
+        completionReason: "stable"
+      },
+      true
+    );
     pending.resolve({
       turnId,
       finalText,
@@ -811,11 +968,155 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       failedReason: null,
       finalText: "",
       itemTexts: new Map(),
+      toolItems: new Map(),
+      activeToolItemIds: new Set(),
+      toolSilenceTimer: null,
       mediaReferences: [],
+      eventSequence: 0,
+      onTurnEvent: null,
+      bufferedTurnEvents: [],
       resolve,
       reject,
       promise
     };
+  }
+
+  private upsertToolItem(pending: PendingTurn, item: AppServerItem): ToolItemState {
+    const id = item.id!;
+    const existing = pending.toolItems.get(id);
+    if (existing) {
+      existing.name = readToolName(item) ?? existing.name;
+      existing.type = readString(item.type) ?? existing.type;
+      return existing;
+    }
+
+    const created: ToolItemState = {
+      id,
+      type: readString(item.type),
+      name: readToolName(item) ?? "tool",
+      output: ""
+    };
+    pending.toolItems.set(id, created);
+    return created;
+  }
+
+  private emitToolEvent(
+    pending: PendingTurn,
+    toolStatus: ToolEventStatus,
+    tool: ToolItemState,
+    summary: string | null
+  ): void {
+    void this.emitTurnEvent(pending, TurnEventType.Status, {
+      toolName: tool.name,
+      toolStatus,
+      ...(summary ? { summary } : {})
+    });
+  }
+
+  private refreshToolSilenceTimer(pending: PendingTurn): void {
+    this.clearToolSilenceTimer(pending);
+    if (
+      this.toolSilenceTimeoutMs <= 0
+      || pending.completed
+      || pending.activeToolItemIds.size === 0
+    ) {
+      return;
+    }
+
+    pending.toolSilenceTimer = setTimeout(() => {
+      void this.handleToolSilenceTimeout(pending);
+    }, this.toolSilenceTimeoutMs);
+  }
+
+  private async handleToolSilenceTimeout(pending: PendingTurn): Promise<void> {
+    if (pending.completed || pending.activeToolItemIds.size === 0) {
+      return;
+    }
+
+    pending.completed = true;
+    const activeToolId = pending.activeToolItemIds.values().next().value as string | undefined;
+    const tool = activeToolId ? pending.toolItems.get(activeToolId) : null;
+    const toolName = tool?.name ?? "tool";
+    const status = `tool silence timeout: ${toolName}`;
+    pending.failedReason = status;
+    this.clearToolSilenceTimer(pending);
+    await this.emitTurnEvent(
+      pending,
+      TurnEventType.Completed,
+      {
+        status,
+        toolName,
+        toolStatus: "silence-timeout"
+      },
+      true
+    );
+    pending.reject(new DesktopDriverError(status, "reply_timeout"));
+  }
+
+  private clearToolSilenceTimer(pending: PendingTurn): void {
+    if (!pending.toolSilenceTimer) {
+      return;
+    }
+
+    clearTimeout(pending.toolSilenceTimer);
+    pending.toolSilenceTimer = null;
+  }
+
+  private async emitTurnEvent(
+    pending: PendingTurn,
+    eventType: TurnEventType,
+    payload: TurnEvent["payload"],
+    isFinal = false
+  ): Promise<void> {
+    pending.eventSequence += 1;
+    const event: TurnEvent = {
+      sessionKey: pending.sessionKey,
+      turnId: pending.turnId,
+      sequence: pending.eventSequence,
+      eventType,
+      createdAt: new Date().toISOString(),
+      isFinal,
+      payload
+    };
+    const onTurnEvent = pending.onTurnEvent;
+    if (!onTurnEvent) {
+      pending.bufferedTurnEvents?.push(event);
+      return;
+    }
+
+    await this.deliverTurnEvent(onTurnEvent, event);
+  }
+
+  private async flushBufferedTurnEvents(pending: PendingTurn): Promise<void> {
+    const events = pending.bufferedTurnEvents;
+    const onTurnEvent = pending.onTurnEvent;
+    if (!events) {
+      return;
+    }
+
+    pending.bufferedTurnEvents = onTurnEvent ? [] : null;
+    if (!onTurnEvent) {
+      return;
+    }
+
+    for (const event of events) {
+      await this.deliverTurnEvent(onTurnEvent, event);
+    }
+  }
+
+  private async deliverTurnEvent(
+    onTurnEvent: (event: TurnEvent) => Promise<void>,
+    event: TurnEvent
+  ): Promise<void> {
+    try {
+      await onTurnEvent(event);
+    } catch (error) {
+      console.warn("[codex-desktop-orchestrator] codex app-server turn event callback failed", {
+        sessionKey: event.sessionKey,
+        turnId: event.turnId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 
   private async forwardThreadSnapshotToApp(threadId: string): Promise<void> {
@@ -1028,6 +1329,15 @@ function normalizeCwd(cwd: string | null | undefined): string | null {
   return value ? value : null;
 }
 
+function parseOptionalPositiveInteger(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function getFailedTurnReason(error: unknown): DesktopDriverError["reason"] {
   if (containsText(error, "context_length_exceeded")) {
     return "context_length_exceeded";
@@ -1227,6 +1537,50 @@ function decodeLegacyThreadRef(threadRef: string): { title: string; projectName:
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function isAgentMessageItem(item: AppServerItem): boolean {
+  return isAgentMessageType(item.type);
+}
+
+function isAgentMessageType(type: string | null | undefined): boolean {
+  return type === "agentMessage";
+}
+
+function readToolName(item: AppServerItem): string | null {
+  return (
+    readString(item.name)
+    ?? readString(item.title)
+    ?? readString(item.command)
+    ?? readString(item.type)
+  );
+}
+
+function summarizeToolItem(item: AppServerItem): string | null {
+  return truncateSummary(
+    readString(item.text)
+    ?? readString(item.output)
+    ?? (item.error ? JSON.stringify(item.error) : null)
+    ?? readString(item.status)
+  );
+}
+
+function truncateSummary(value: string | null | undefined): string | null {
+  const text = value?.trim();
+  if (!text) {
+    return null;
+  }
+
+  return text.length > 500 ? `${text.slice(0, 497)}...` : text;
+}
+
+function isFailedToolItem(item: AppServerItem): boolean {
+  if (item.error) {
+    return true;
+  }
+
+  const status = item.status?.trim();
+  return Boolean(status && /fail|error|cancel|timeout/i.test(status));
 }
 
 function formatPermissionMode(

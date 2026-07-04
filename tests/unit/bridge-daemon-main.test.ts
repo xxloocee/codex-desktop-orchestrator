@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { DesktopDriverError } from "../../packages/domain/src/driver.js";
-import type { InboundMessage, TurnEvent } from "../../packages/domain/src/message.js";
+import type { DeliveryRecord, InboundMessage, TurnEvent } from "../../packages/domain/src/message.js";
 import { createIngressMessageHandler, resolveTurnEventOrchestrator } from "../../apps/bridge-daemon/src/main.js";
 
 function createMessage(overrides: Partial<InboundMessage> = {}): InboundMessage {
@@ -14,6 +14,15 @@ function createMessage(overrides: Partial<InboundMessage> = {}): InboundMessage 
     text: "hello",
     receivedAt: "2026-04-09T12:00:00.000Z",
     ...overrides
+  };
+}
+
+function createDeliveryRecord(draftId: string): DeliveryRecord {
+  return {
+    jobId: draftId,
+    sessionKey: "qqbot:default::qq:c2c:abc-123",
+    providerMessageId: "provider-msg-1",
+    deliveredAt: "2026-04-09T12:00:01.000Z"
   };
 }
 
@@ -75,14 +84,26 @@ describe("bridge daemon main", () => {
       handleInbound: vi.fn().mockRejectedValue(new Error("Codex app-server turn failed"))
     };
     const errorEgress = {
-      deliver: vi.fn().mockResolvedValue(undefined)
+      deliver: vi.fn(async (draft) => createDeliveryRecord(draft.draftId))
+    };
+    const transcriptStore = {
+      recordOutbound: vi.fn().mockResolvedValue(undefined)
+    };
+    const deliveryJobStore = {
+      claimDueJobs: vi.fn().mockResolvedValue([]),
+      markDelivered: vi.fn().mockResolvedValue(undefined),
+      markAttemptFailed: vi.fn().mockResolvedValue(undefined),
+      recoverInFlight: vi.fn().mockResolvedValue(0),
+      listJobs: vi.fn().mockResolvedValue([])
     };
     vi.spyOn(console, "error").mockImplementation(() => {});
 
     const handler = createIngressMessageHandler({
       threadCommandHandler: threadCommandHandler as any,
       orchestrator,
-      errorEgress
+      errorEgress,
+      transcriptStore,
+      deliveryJobStore
     });
 
     await expect(handler(createMessage())).resolves.toBeUndefined();
@@ -93,6 +114,17 @@ describe("bridge daemon main", () => {
         text: "[bridge error] Codex app-server turn failed"
       })
     );
+    expect(transcriptStore.recordOutbound).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "[bridge error] Codex app-server turn failed",
+        replyToMessageId: "msg-main-1"
+      })
+    );
+    expect(deliveryJobStore.markDelivered).toHaveBeenCalledWith({
+      jobId: expect.any(String),
+      deliveredAt: "2026-04-09T12:00:01.000Z",
+      providerMessageId: "provider-msg-1"
+    });
   });
 
   it("sends an actionable reply when the bound Codex thread exceeds the context window", async () => {
@@ -105,7 +137,7 @@ describe("bridge daemon main", () => {
       )
     };
     const errorEgress = {
-      deliver: vi.fn().mockResolvedValue(undefined)
+      deliver: vi.fn(async (draft) => createDeliveryRecord(draft.draftId))
     };
     vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -126,6 +158,35 @@ describe("bridge daemon main", () => {
     expect(errorEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
         text: expect.stringContaining("/tn <title>")
+      })
+    );
+  });
+
+  it("sends a compact bridge error reply for Codex service input validation failures", async () => {
+    const threadCommandHandler = {
+      handleIfCommand: vi.fn().mockResolvedValue(false)
+    };
+    const orchestrator = {
+      handleInbound: vi.fn().mockRejectedValue(
+        new DesktopDriverError("Codex app-server turn failed: service_error", "service_error")
+      )
+    };
+    const errorEgress = {
+      deliver: vi.fn(async (draft) => createDeliveryRecord(draft.draftId))
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const handler = createIngressMessageHandler({
+      threadCommandHandler: threadCommandHandler as any,
+      orchestrator,
+      errorEgress
+    });
+
+    await expect(handler(createMessage())).resolves.toBeUndefined();
+    expect(errorEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        replyToMessageId: "msg-main-1",
+        text: expect.stringContaining("Codex rejected this message input")
       })
     );
   });

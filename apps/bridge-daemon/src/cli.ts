@@ -6,6 +6,8 @@ import { ZodError } from "zod";
 import { discoverCodexInstallations } from "./codex-discovery.js";
 import { loadConfig, loadConfigFromEnv, resolveConfigPath } from "./config.js";
 import { ensureCodexDesktopForDev, type DevLaunchConfig } from "./dev-launch.js";
+import { openReadonlySqliteDatabase } from "../../../packages/store/src/sqlite.js";
+import { SqliteRuntimeRecoveryStore } from "../../../packages/store/src/runtime-recovery-repo.js";
 import { installBridgeRuntimeSignalHandlers, runBridgeDaemon } from "./main.js";
 import {
   clearRuntimeState,
@@ -318,6 +320,37 @@ function runDoctor(options: {
 
   try {
     const config = loadConfig(options.env);
+    const databasePath = path.resolve(config.databasePath);
+    if (!fs.existsSync(databasePath)) {
+      checks.push({
+        name: "recovery",
+        status: "ok",
+        message: `database not initialized: ${databasePath}`
+      });
+    } else {
+      const db = openReadonlySqliteDatabase(databasePath);
+      try {
+        const recovery = new SqliteRuntimeRecoveryStore(db).inspect();
+        const runtimeStatus = readRuntimeStatus(paths);
+        const hasUnhealthyRecoveryState =
+          recovery.expiredActiveTurns > 0
+          || (
+            !runtimeStatus.running
+            && (
+              recovery.activeTurns > 0
+              || recovery.sessionLocks.expired > 0
+              || recovery.threadLocks.expired > 0
+            )
+          );
+        checks.push({
+          name: "recovery",
+          status: hasUnhealthyRecoveryState ? "failed" : "ok",
+          message: `activeTurns=${recovery.activeTurns}, expiredActiveTurns=${recovery.expiredActiveTurns}, orphanableActiveTurns=${recovery.orphanableActiveTurns}, sessionLocks=${recovery.sessionLocks.total}/${recovery.sessionLocks.expired} expired, threadLocks=${recovery.threadLocks.total}/${recovery.threadLocks.expired} expired`
+        });
+      } finally {
+        db.close();
+      }
+    }
     checks.push({
       name: "config",
       status: "ok",

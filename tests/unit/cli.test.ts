@@ -1,8 +1,19 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCli } from "../../apps/bridge-daemon/src/cli.js";
+
+const require = createRequire(import.meta.url);
+const BetterSqlite3 = require("better-sqlite3") as new (filePath: string) => {
+  exec(sql: string): void;
+  prepare(sql: string): {
+    get(...params: unknown[]): unknown;
+    run(...params: unknown[]): unknown;
+  };
+  close(): void;
+};
 
 function createTempDir(prefix: string) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -342,6 +353,409 @@ describe("cli", () => {
     };
     expect(payload.status).toBe("failed");
     expect(payload.checks).toContainEqual(expect.objectContaining({ name: "config", status: "failed" }));
+  });
+
+  it("includes orphaned runtime state in doctor output", async () => {
+    const runtimeHome = createTempDir("qq-codex-runtime-");
+    const dbPath = path.join(runtimeHome, "bridge.sqlite");
+    fs.writeFileSync(path.join(runtimeHome, "config.json"), `${JSON.stringify({
+      databasePath: dbPath,
+      runtime: {
+        listenHost: "127.0.0.1",
+        listenPort: 3100,
+        webhookPath: "/webhooks/qq"
+      },
+      qqBot: {
+        accountId: "default",
+        appId: "app-id",
+        clientSecret: "secret",
+        markdownSupport: false,
+        stt: null
+      },
+      codexDesktop: {
+        appName: "Codex",
+        remoteDebuggingPort: 9229,
+        cwd: null
+      },
+      conversationProvider: "codex-desktop",
+      accessControl: {
+        mode: "allow-all",
+        allowedAccountKeys: [],
+        allowedC2cSenderIds: [],
+        allowedGroupIds: [],
+        allowedGroupMemberIds: [],
+        requireMentionInGroup: true,
+        botMentionPatterns: []
+      },
+      projectAliases: {}
+    })}\n`);
+    const { createSqliteDatabase } = await import("../../packages/store/src/sqlite.js");
+    const db = createSqliteDatabase(dbPath);
+    db.prepare(
+      `INSERT INTO bridge_turns (
+        turn_id, session_key, codex_thread_ref, codex_turn_ref, qq_message_id,
+        status, started_at, updated_at, deadline_at, last_event_at,
+        last_tool_name, last_error, delivered_text_length
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0)`
+    ).run(
+      "turn-stale-1",
+      "qqbot:default::qq:c2c:abc-123",
+      "codex-app-thread:thread-1",
+      "msg-1",
+      "running",
+      "2026-07-01T10:00:00.000Z",
+      "2026-07-01T10:00:00.000Z",
+      "2000-01-01T00:00:00.000Z"
+    );
+    db.prepare(
+      `INSERT INTO session_locks (session_key, owner, locked_at, expires_at)
+       VALUES (?, ?, ?, ?)`
+    ).run(
+      "qqbot:default::qq:c2c:abc-123",
+      "previous-process",
+      "2026-07-01T10:00:00.000Z",
+      "2000-01-01T00:00:00.000Z"
+    );
+    db.close();
+    const io = collectWrites();
+
+    await expect(
+      runCli(["doctor"], {
+        env: { QQ_CODEX_RUNTIME_HOME: runtimeHome },
+        writeStdout: io.writeStdout,
+        writeStderr: io.writeStderr
+      })
+    ).resolves.toBe(1);
+
+    const payload = JSON.parse(io.stdout[0] ?? "{}") as {
+      checks?: Array<{ name: string; status: string; message: string }>;
+    };
+    expect(payload.checks).toContainEqual(expect.objectContaining({
+      name: "recovery",
+      status: "failed",
+      message: expect.stringContaining("activeTurns=1")
+    }));
+    expect(payload.checks).toContainEqual(expect.objectContaining({
+      name: "recovery",
+      message: expect.stringContaining("sessionLocks=1/1 expired")
+    }));
+  });
+
+  it("does not create a database when doctor inspects an uninitialized runtime", async () => {
+    const runtimeHome = createTempDir("qq-codex-runtime-");
+    const dbPath = path.join(runtimeHome, "missing", "bridge.sqlite");
+    fs.writeFileSync(path.join(runtimeHome, "config.json"), `${JSON.stringify({
+      databasePath: dbPath,
+      runtime: {
+        listenHost: "127.0.0.1",
+        listenPort: 3100,
+        webhookPath: "/webhooks/qq"
+      },
+      qqBot: {
+        accountId: "default",
+        appId: "app-id",
+        clientSecret: "secret",
+        markdownSupport: false,
+        stt: null
+      },
+      codexDesktop: {
+        appName: "Codex",
+        remoteDebuggingPort: 9229,
+        cwd: null
+      },
+      conversationProvider: "codex-desktop",
+      accessControl: {
+        mode: "allow-all",
+        allowedAccountKeys: [],
+        allowedC2cSenderIds: [],
+        allowedGroupIds: [],
+        allowedGroupMemberIds: [],
+        requireMentionInGroup: true,
+        botMentionPatterns: []
+      },
+      projectAliases: {}
+    })}\n`);
+    const io = collectWrites();
+
+    await runCli(["doctor"], {
+      env: { QQ_CODEX_RUNTIME_HOME: runtimeHome },
+      writeStdout: io.writeStdout,
+      writeStderr: io.writeStderr
+    });
+
+    const payload = JSON.parse(io.stdout[0] ?? "{}") as {
+      checks?: Array<{ name: string; status: string; message: string }>;
+    };
+    expect(fs.existsSync(dbPath)).toBe(false);
+    expect(payload.checks).toContainEqual(expect.objectContaining({
+      name: "recovery",
+      status: "ok",
+      message: expect.stringContaining("database not initialized")
+    }));
+  });
+
+  it("does not fail doctor when an existing database lacks recovery tables", async () => {
+    const runtimeHome = createTempDir("qq-codex-runtime-");
+    const dbPath = path.join(runtimeHome, "bridge.sqlite");
+    fs.writeFileSync(path.join(runtimeHome, "config.json"), `${JSON.stringify({
+      databasePath: dbPath,
+      runtime: {
+        listenHost: "127.0.0.1",
+        listenPort: 3100,
+        webhookPath: "/webhooks/qq"
+      },
+      qqBot: {
+        accountId: "default",
+        appId: "app-id",
+        clientSecret: "secret",
+        markdownSupport: false,
+        stt: null
+      },
+      codexDesktop: {
+        appName: "Codex",
+        remoteDebuggingPort: 9229,
+        cwd: null
+      },
+      conversationProvider: "codex-desktop",
+      accessControl: {
+        mode: "allow-all",
+        allowedAccountKeys: [],
+        allowedC2cSenderIds: [],
+        allowedGroupIds: [],
+        allowedGroupMemberIds: [],
+        requireMentionInGroup: true,
+        botMentionPatterns: []
+      },
+      projectAliases: {}
+    })}\n`);
+    const db = new BetterSqlite3(dbPath);
+    db.exec(`
+      CREATE TABLE delivery_jobs (
+        job_id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    db.close();
+    const io = collectWrites();
+
+    await runCli(["doctor"], {
+      env: { QQ_CODEX_RUNTIME_HOME: runtimeHome },
+      writeStdout: io.writeStdout,
+      writeStderr: io.writeStderr
+    });
+
+    const payload = JSON.parse(io.stdout[0] ?? "{}") as {
+      checks?: Array<{ name: string; status: string; message: string }>;
+    };
+    expect(payload.checks).toContainEqual(expect.objectContaining({
+      name: "recovery",
+      status: "ok",
+      message: expect.stringContaining("activeTurns=0")
+    }));
+    expect(payload.checks).toContainEqual(expect.objectContaining({
+      name: "config",
+      status: "ok"
+    }));
+  });
+
+  it("does not migrate legacy delivery jobs when doctor inspects an existing database", async () => {
+    const runtimeHome = createTempDir("qq-codex-runtime-");
+    const dbPath = path.join(runtimeHome, "bridge.sqlite");
+    fs.writeFileSync(path.join(runtimeHome, "config.json"), `${JSON.stringify({
+      databasePath: dbPath,
+      runtime: {
+        listenHost: "127.0.0.1",
+        listenPort: 3100,
+        webhookPath: "/webhooks/qq"
+      },
+      qqBot: {
+        accountId: "default",
+        appId: "app-id",
+        clientSecret: "secret",
+        markdownSupport: false,
+        stt: null
+      },
+      codexDesktop: {
+        appName: "Codex",
+        remoteDebuggingPort: 9229,
+        cwd: null
+      },
+      conversationProvider: "codex-desktop",
+      accessControl: {
+        mode: "allow-all",
+        allowedAccountKeys: [],
+        allowedC2cSenderIds: [],
+        allowedGroupIds: [],
+        allowedGroupMemberIds: [],
+        requireMentionInGroup: true,
+        botMentionPatterns: []
+      },
+      projectAliases: {}
+    })}\n`);
+    const db = new BetterSqlite3(dbPath);
+    db.exec(`
+      CREATE TABLE bridge_turns (
+        turn_id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        codex_thread_ref TEXT,
+        codex_turn_ref TEXT,
+        qq_message_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        deadline_at TEXT,
+        last_event_at TEXT,
+        last_tool_name TEXT,
+        last_error TEXT,
+        delivered_text_length INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE session_locks (
+        session_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        locked_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+      CREATE TABLE thread_locks (
+        thread_ref TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        locked_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+      CREATE TABLE delivery_jobs (
+        job_id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        next_attempt_at TEXT,
+        delivered_at TEXT,
+        provider_message_id TEXT
+      );
+    `);
+    db.prepare(
+      `INSERT INTO delivery_jobs (
+        job_id, session_key, status, attempt_count, payload_json,
+        last_error, created_at, updated_at, next_attempt_at, delivered_at, provider_message_id
+      ) VALUES (?, ?, 'pending', 0, ?, NULL, ?, ?, NULL, NULL, NULL)`
+    ).run(
+      "legacy-draft-1",
+      "qqbot:default::qq:c2c:abc-123",
+      JSON.stringify({
+        draftId: "legacy-draft-1",
+        sessionKey: "qqbot:default::qq:c2c:abc-123",
+        text: "old reply",
+        createdAt: "2026-06-30T10:00:00.000Z"
+      }),
+      "2026-06-30T10:00:00.000Z",
+      "2026-06-30T10:00:00.000Z"
+    );
+    db.close();
+    const io = collectWrites();
+
+    await runCli(["doctor"], {
+      env: { QQ_CODEX_RUNTIME_HOME: runtimeHome },
+      writeStdout: io.writeStdout,
+      writeStderr: io.writeStderr
+    });
+
+    const inspectedDb = new BetterSqlite3(dbPath);
+    const row = inspectedDb.prepare(
+      `SELECT status, delivered_at AS deliveredAt FROM delivery_jobs WHERE job_id = ?`
+    ).get("legacy-draft-1") as { status: string; deliveredAt: string | null };
+    inspectedDb.close();
+    expect(row).toEqual({
+      status: "pending",
+      deliveredAt: null
+    });
+  });
+
+  it("does not fail doctor for active turns while the runtime is running", async () => {
+    const runtimeHome = createTempDir("qq-codex-runtime-");
+    const dbPath = path.join(runtimeHome, "bridge.sqlite");
+    fs.writeFileSync(path.join(runtimeHome, "config.json"), `${JSON.stringify({
+      databasePath: dbPath,
+      runtime: {
+        listenHost: "127.0.0.1",
+        listenPort: 3100,
+        webhookPath: "/webhooks/qq"
+      },
+      qqBot: {
+        accountId: "default",
+        appId: "app-id",
+        clientSecret: "secret",
+        markdownSupport: false,
+        stt: null
+      },
+      codexDesktop: {
+        appName: "Codex",
+        remoteDebuggingPort: 9229,
+        cwd: null
+      },
+      conversationProvider: "codex-desktop",
+      accessControl: {
+        mode: "allow-all",
+        allowedAccountKeys: [],
+        allowedC2cSenderIds: [],
+        allowedGroupIds: [],
+        allowedGroupMemberIds: [],
+        requireMentionInGroup: true,
+        botMentionPatterns: []
+      },
+      projectAliases: {}
+    })}\n`);
+    fs.writeFileSync(path.join(runtimeHome, "runtime.pid"), `${process.pid}\n`);
+    fs.writeFileSync(path.join(runtimeHome, "state.json"), `${JSON.stringify({
+      pid: process.pid,
+      startedAt: "2026-07-01T10:00:00.000Z",
+      listenHost: "127.0.0.1",
+      listenPort: 3100,
+      channels: ["qqbot:default"],
+      version: "0.0.1"
+    })}\n`);
+    const { createSqliteDatabase } = await import("../../packages/store/src/sqlite.js");
+    const db = createSqliteDatabase(dbPath);
+    db.prepare(
+      `INSERT INTO bridge_turns (
+        turn_id, session_key, codex_thread_ref, codex_turn_ref, qq_message_id,
+        status, started_at, updated_at, deadline_at, last_event_at,
+        last_tool_name, last_error, delivered_text_length
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0)`
+    ).run(
+      "turn-active-1",
+      "qqbot:default::qq:c2c:abc-123",
+      "codex-app-thread:thread-1",
+      "msg-1",
+      "running",
+      "2026-07-01T10:00:00.000Z",
+      "2026-07-01T10:00:00.000Z",
+      "2999-01-01T00:00:00.000Z"
+    );
+    db.close();
+    const io = collectWrites();
+
+    await runCli(["doctor"], {
+      env: { QQ_CODEX_RUNTIME_HOME: runtimeHome },
+      writeStdout: io.writeStdout,
+      writeStderr: io.writeStderr
+    });
+
+    const payload = JSON.parse(io.stdout[0] ?? "{}") as {
+      checks?: Array<{ name: string; status: string; message: string }>;
+    };
+    expect(payload.checks).toContainEqual(expect.objectContaining({
+      name: "recovery",
+      status: "ok",
+      message: expect.stringContaining("activeTurns=1")
+    }));
   });
 
   it("prints runtime log tail", async () => {
