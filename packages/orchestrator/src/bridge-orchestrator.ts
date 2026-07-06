@@ -30,7 +30,7 @@ type BridgeOrchestratorDeps = {
   conversationProvider: ConversationProviderPort;
   qqEgress: QqEgressPort;
   draftFormatter?: (draft: OutboundDraft) => OutboundDraft;
-  turnTimeoutMs?: number;
+  turnHeartbeatIntervalMs?: number;
 };
 
 type TurnState = {
@@ -39,9 +39,14 @@ type TurnState = {
   sentText: string;
   sentArtifactKeys: Set<string>;
   lastEventAt: string | null;
+  lastPartialFlushAtMs: number | null;
   completed: boolean;
   finalFlushed: boolean;
 };
+
+const PARTIAL_TURN_FLUSH_MIN_CHARS = 80;
+const PARTIAL_TURN_FLUSH_INTERVAL_MS = 3_000;
+const DEFAULT_TURN_HEARTBEAT_INTERVAL_MS = 2 * 60_000;
 
 export class BridgeOrchestrator {
   private readonly recentInboundFingerprints = new Map<
@@ -51,11 +56,12 @@ export class BridgeOrchestrator {
   private readonly turnStates = new Map<string, TurnState>();
   private readonly sessionTurnTails = new Map<string, Promise<void>>();
   private readonly draftFormatter: (draft: OutboundDraft) => OutboundDraft;
-  private readonly turnTimeoutMs: number;
+  private readonly turnHeartbeatIntervalMs: number;
 
   constructor(private readonly deps: BridgeOrchestratorDeps) {
     this.draftFormatter = deps.draftFormatter ?? ((draft) => draft);
-    this.turnTimeoutMs = deps.turnTimeoutMs ?? 10 * 60_000;
+    this.turnHeartbeatIntervalMs =
+      deps.turnHeartbeatIntervalMs ?? DEFAULT_TURN_HEARTBEAT_INTERVAL_MS;
   }
 
   async handleInbound(message: InboundMessage): Promise<void> {
@@ -128,6 +134,8 @@ export class BridgeOrchestrator {
         await this.deps.turnStore?.updateDeadline(bridgeTurnId, null);
       },
       async () => {
+        let deliverFinalStatusDraft: ((text: string) => Promise<void>) | null = null;
+        let stopTurnHeartbeat: (() => void) | null = null;
         try {
           if (await this.isTurnCancelled(bridgeTurnId)) {
             throw new DesktopDriverError(
@@ -136,13 +144,12 @@ export class BridgeOrchestrator {
             );
           }
           await this.deps.turnStore?.updateStatus(bridgeTurnId, BridgeTurnStatus.Running);
-          await this.deps.turnStore?.updateDeadline(
-            bridgeTurnId,
-            new Date(Date.now() + this.turnTimeoutMs).toISOString()
-          );
+          await this.deps.turnStore?.updateDeadline(bridgeTurnId, null);
           const deliveredDraftIds = new Set<string>();
           const deliveryErrors: string[] = [];
           let taskStartedDraftSent = false;
+          let heartbeatTimer: NodeJS.Timeout | null = null;
+          let heartbeatCount = 0;
           const handleDraft = async (draft: OutboundDraft) => {
             if (await this.isTurnCancelled(bridgeTurnId)) {
               return;
@@ -187,6 +194,37 @@ export class BridgeOrchestrator {
               });
             }
           };
+          const deliverStatusDraft = async (draftId: string, text: string) => {
+            await handleDraft({
+              draftId,
+              sessionKey: message.sessionKey,
+              text,
+              createdAt: new Date().toISOString(),
+              replyToMessageId: message.messageId
+            });
+          };
+          deliverFinalStatusDraft = async (text: string) => {
+            await deliverStatusDraft(`task-ended:${message.messageId}`, text);
+          };
+          const startHeartbeat = () => {
+            if (heartbeatTimer || this.turnHeartbeatIntervalMs <= 0) {
+              return;
+            }
+            heartbeatTimer = setInterval(() => {
+              heartbeatCount += 1;
+              void deliverStatusDraft(
+                `task-heartbeat:${message.messageId}:${heartbeatCount}`,
+                "任务仍在运行。"
+              );
+            }, this.turnHeartbeatIntervalMs);
+          };
+          stopTurnHeartbeat = () => {
+            if (!heartbeatTimer) {
+              return;
+            }
+            clearInterval(heartbeatTimer);
+            heartbeatTimer = null;
+          };
           const deliverTaskStarted = async () => {
             if (taskStartedDraftSent) {
               return;
@@ -214,11 +252,9 @@ export class BridgeOrchestrator {
                 );
               }
               await this.deps.turnStore?.updateStatus(bridgeTurnId, BridgeTurnStatus.Running);
-              await this.deps.turnStore?.updateDeadline(
-                bridgeTurnId,
-                new Date(Date.now() + this.turnTimeoutMs).toISOString()
-              );
+              await this.deps.turnStore?.updateDeadline(bridgeTurnId, null);
               await deliverTaskStarted();
+              startHeartbeat();
             },
             onThreadBound: async (codexThreadRef) => {
               await this.deps.turnStore?.updateCodexThreadRef(bridgeTurnId, codexThreadRef);
@@ -230,6 +266,7 @@ export class BridgeOrchestrator {
             await handleDraft(draft);
           }
 
+          stopTurnHeartbeat?.();
           await this.deps.sessionStore.updateSessionStatus(
             message.sessionKey,
             BridgeSessionStatus.Active,
@@ -244,6 +281,7 @@ export class BridgeOrchestrator {
             deliveryErrors.length > 0 ? deliveryErrors.at(-1) ?? null : null
           );
         } catch (error) {
+          stopTurnHeartbeat?.();
           const lastError = error instanceof Error ? error.message : String(error);
           if (error instanceof DesktopDriverError && error.reason === "service_error") {
             await this.deps.turnStore?.updateStatus(bridgeTurnId, BridgeTurnStatus.Failed, lastError);
@@ -257,6 +295,7 @@ export class BridgeOrchestrator {
 
           const recoverableStatus = getRecoverableTurnStatus(error);
           if (recoverableStatus) {
+            await deliverFinalStatusDraft?.(buildRecoverableTurnStatusText(recoverableStatus, error));
             await this.deps.turnStore?.updateStatus(bridgeTurnId, recoverableStatus, lastError);
             await this.deps.sessionStore.updateSessionStatus(
               message.sessionKey,
@@ -328,6 +367,11 @@ export class BridgeOrchestrator {
         state.assembledText += event.payload.text;
       }
 
+      if (event.eventType === TurnEventType.Delta) {
+        await this.flushPartialTurnText(event, state);
+        return;
+      }
+
       if (event.eventType !== TurnEventType.Completed) {
         return;
       }
@@ -366,18 +410,7 @@ export class BridgeOrchestrator {
         return;
       }
 
-      await this.deps.transcriptStore.recordOutbound(normalizedDraft);
-      try {
-        const delivery = await this.deps.qqEgress.deliver(normalizedDraft);
-        await markSynchronousDeliveryResult(
-          this.deps.deliveryJobStore,
-          normalizedDraft,
-          delivery
-        );
-      } catch (error) {
-        await markSynchronousDeliveryFailure(this.deps.deliveryJobStore, normalizedDraft, error);
-        throw error;
-      }
+      await this.deliverTurnEventDraft(event, normalizedDraft);
       this.recordDeliveredDraft(normalizedDraft);
       state.sentText = state.assembledText;
       state.completed = true;
@@ -449,6 +482,7 @@ export class BridgeOrchestrator {
       sentText: "",
       sentArtifactKeys: new Set<string>(),
       lastEventAt: null,
+      lastPartialFlushAtMs: null,
       completed: false,
       finalFlushed: false
     };
@@ -468,6 +502,7 @@ export class BridgeOrchestrator {
       sentText: "",
       sentArtifactKeys: new Set<string>(),
       lastEventAt: null,
+      lastPartialFlushAtMs: null,
       completed: false,
       finalFlushed: false
     };
@@ -502,6 +537,68 @@ export class BridgeOrchestrator {
       text: pendingText,
       mediaArtifacts: pendingArtifacts
     };
+  }
+
+  private async flushPartialTurnText(event: TurnEvent, state: TurnState): Promise<void> {
+    const pendingText = computePendingTurnText(state.sentText, state.assembledText);
+    if (!pendingText.trim()) {
+      return;
+    }
+
+    const eventAtMs = Date.parse(event.createdAt);
+    const hasEnoughText = pendingText.length >= PARTIAL_TURN_FLUSH_MIN_CHARS;
+    const hasWaited =
+      Number.isFinite(eventAtMs)
+      && state.lastPartialFlushAtMs !== null
+      && eventAtMs - state.lastPartialFlushAtMs >= PARTIAL_TURN_FLUSH_INTERVAL_MS
+      && pendingText.length >= 20;
+    if (!hasEnoughText && !hasWaited) {
+      return;
+    }
+
+    const draft = this.draftFormatter({
+      draftId: randomUUID(),
+      turnId: event.turnId,
+      sessionKey: event.sessionKey,
+      text: pendingText,
+      createdAt: event.createdAt,
+      ...(event.payload.replyToMessageId
+        ? { replyToMessageId: event.payload.replyToMessageId }
+        : {})
+    });
+
+    if (isEmptyDraft(draft)) {
+      state.sentText = state.assembledText;
+      return;
+    }
+
+    await this.deliverTurnEventDraft(event, draft);
+    this.recordDeliveredDraft(draft);
+    state.sentText = state.assembledText;
+    state.lastPartialFlushAtMs = Number.isFinite(eventAtMs) ? eventAtMs : Date.now();
+  }
+
+  private async deliverTurnEventDraft(event: TurnEvent, draft: OutboundDraft): Promise<void> {
+    await this.deps.transcriptStore.recordOutbound(draft);
+    try {
+      const delivery = await this.deps.qqEgress.deliver(draft);
+      await markSynchronousDeliveryResult(
+        this.deps.deliveryJobStore,
+        draft,
+        delivery
+      );
+      const turn = await this.deps.turnStore?.getTurnByCodexTurn(
+        event.sessionKey,
+        event.turnId,
+        event.payload.replyToMessageId ?? null
+      );
+      if (turn) {
+        await this.deps.turnStore?.addDeliveredText(turn.turnId, draft.text.length);
+      }
+    } catch (error) {
+      await markSynchronousDeliveryFailure(this.deps.deliveryJobStore, draft, error);
+      throw error;
+    }
   }
 
   private async isTurnCancelled(turnId: string): Promise<boolean> {
@@ -572,7 +669,22 @@ function getRecoverableTurnStatus(error: unknown): BridgeTurnStatus | null {
     return BridgeTurnStatus.Cancelled;
   }
 
+  if (error.reason === "context_length_exceeded") {
+    return BridgeTurnStatus.Failed;
+  }
+
   return null;
+}
+
+function buildRecoverableTurnStatusText(status: BridgeTurnStatus, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (status === BridgeTurnStatus.Cancelled) {
+    return "任务已取消。";
+  }
+  if (status === BridgeTurnStatus.TimedOut) {
+    return `任务已停止：${message}`;
+  }
+  return `任务已结束：${message}`;
 }
 
 function readTurnEventError(event: TurnEvent): string | null {

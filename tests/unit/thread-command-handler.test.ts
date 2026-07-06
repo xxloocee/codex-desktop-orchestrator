@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { BridgeSessionStatus } from "../../packages/domain/src/session.js";
 import { BridgeTurnStatus } from "../../packages/domain/src/turn.js";
 import { DesktopDriverError } from "../../packages/domain/src/driver.js";
-import { DeliveryJobStatus, type InboundMessage } from "../../packages/domain/src/message.js";
+import { DeliveryJobStatus, type InboundMessage, type OutboundDraft } from "../../packages/domain/src/message.js";
 import type { DesktopDriverPort } from "../../packages/ports/src/conversation.js";
 import type { QqEgressPort } from "../../packages/ports/src/qq.js";
 import type {
@@ -346,6 +346,11 @@ describe("thread command handler", () => {
       "qqbot:default::qq:c2c:OPENID123",
       "codex-thread:page-1:bbb"
     );
+    expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      BridgeSessionStatus.Active,
+      null
+    );
     expect(sessionStore.updateSkillContextKey).toHaveBeenCalledWith(
       "qqbot:default::qq:c2c:OPENID123",
       null
@@ -415,6 +420,46 @@ describe("thread command handler", () => {
     );
   });
 
+  it("creates a Codex thread and restores active status for /thread new", async () => {
+    const sessionStore = createSessionStore();
+    vi.mocked(sessionStore.getSession).mockResolvedValue({
+      sessionKey: "qqbot:default::qq:c2c:OPENID123",
+      accountKey: "qqbot:default",
+      peerKey: "qq:c2c:OPENID123",
+      chatType: "c2c",
+      peerId: "OPENID123",
+      codexThreadRef: null,
+      lastCodexTurnId: null,
+      skillContextKey: null,
+      conversationProvider: "codex-desktop",
+      status: BridgeSessionStatus.NeedsRebind,
+      lastInboundAt: null,
+      lastOutboundAt: null,
+      lastError: "stale binding"
+    });
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver();
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      desktopDriver,
+      qqEgress
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/thread new 新线程"))).resolves.toBe(true);
+
+    expect(sessionStore.updateBinding).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      "codex-thread:page-1:new"
+    );
+    expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      BridgeSessionStatus.Active,
+      null
+    );
+  });
+
   it("shows help for /help", async () => {
     const sessionStore = createSessionStore();
     const transcriptStore = createTranscriptStore();
@@ -432,6 +477,16 @@ describe("thread command handler", () => {
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
         text: expect.stringContaining("| 查看 Codex 最近线程 | `/threads` | `/t` |")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("| 查看项目/别名 | `/projects`、`/aliases` | - |")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("| 查看/切换 ChatGPT 对话 | `/cgpt`、`/cgpt use <序号>` | - |")
       })
     );
     expect(qqEgress.deliver).toHaveBeenCalledWith(
@@ -478,6 +533,11 @@ describe("thread command handler", () => {
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
         text: expect.stringContaining("| 查看 ChatGPT 最近对话 | `/threads` | `/t` |")
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("| 新建 ChatGPT 对话 | `/cgpt new` | - |")
       })
     );
     expect(qqEgress.deliver).toHaveBeenCalledWith(
@@ -560,6 +620,99 @@ describe("thread command handler", () => {
       expect.objectContaining({
         text: expect.stringContaining("Status: running")
       })
+    );
+  });
+
+  it("triggers Codex built-in review for /代码审查", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    const reviewDraft: OutboundDraft = {
+      draftId: "review-draft-1",
+      sessionKey: "qqbot:default::qq:c2c:OPENID123",
+      text: "审查结果",
+      createdAt: "2026-04-09T16:00:01.000Z"
+    };
+    const desktopDriver = createDriver({
+      openOrBindSession: vi.fn().mockResolvedValue({
+        sessionKey: "qqbot:default::qq:c2c:OPENID123",
+        codexThreadRef: "codex-thread:page-1:aaa"
+      }),
+      collectAssistantReply: vi.fn().mockResolvedValue([reviewDraft])
+    });
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      desktopDriver,
+      qqEgress
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/代码审查"))).resolves.toBe(true);
+
+    expect(desktopDriver.sendUserMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ codexThreadRef: "codex-thread:page-1:aaa" }),
+      expect.objectContaining({ text: "/审查" })
+    );
+    expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      BridgeSessionStatus.Active,
+      null
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "审查结果",
+        replyToMessageId: "msg-1"
+      })
+    );
+  });
+
+  it("does not reuse a stale binding for /代码审查 when the session needs rebind", async () => {
+    const sessionStore = createSessionStore();
+    vi.mocked(sessionStore.getSession).mockResolvedValue({
+      sessionKey: "qqbot:default::qq:c2c:OPENID123",
+      accountKey: "qqbot:default",
+      peerKey: "qq:c2c:OPENID123",
+      chatType: "c2c",
+      peerId: "OPENID123",
+      codexThreadRef: "codex-thread:stale",
+      lastCodexTurnId: null,
+      skillContextKey: null,
+      conversationProvider: "codex-desktop",
+      status: BridgeSessionStatus.NeedsRebind,
+      lastInboundAt: null,
+      lastOutboundAt: null,
+      lastError: "stale binding"
+    });
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver({
+      openOrBindSession: vi.fn().mockResolvedValue({
+        sessionKey: "qqbot:default::qq:c2c:OPENID123",
+        codexThreadRef: "codex-thread:fresh"
+      }),
+      collectAssistantReply: vi.fn().mockResolvedValue([])
+    });
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      desktopDriver,
+      qqEgress
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/代码审查"))).resolves.toBe(true);
+
+    expect(desktopDriver.openOrBindSession).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      null
+    );
+    expect(sessionStore.updateBinding).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      "codex-thread:fresh"
+    );
+    expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      BridgeSessionStatus.Active,
+      null
     );
   });
 
@@ -1050,9 +1203,52 @@ describe("thread command handler", () => {
     expect(desktopDriver.switchToThread).not.toHaveBeenCalled();
     expect(chatgptDriver.switchToChat).toHaveBeenCalledWith("产品海报");
     expect(chatgptDriver.markSwitched).toHaveBeenCalledWith("qqbot:default::qq:c2c:OPENID123", "产品海报");
+    expect(sessionStore.updateConversationProvider).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      "chatgpt-desktop"
+    );
+    expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      BridgeSessionStatus.Active,
+      null
+    );
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
         text: expect.stringContaining("已切换到 ChatGPT 对话：产品海报")
+      })
+    );
+  });
+
+  it("switches /cgpt use to the ChatGPT source for following messages", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver();
+    const chatgptDriver = createChatgptDriver();
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      desktopDriver,
+      qqEgress,
+      chatgptDriver: chatgptDriver as never
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/cgpt use 2"))).resolves.toBe(true);
+
+    expect(chatgptDriver.switchToChat).toHaveBeenCalledWith("产品海报");
+    expect(chatgptDriver.markSwitched).toHaveBeenCalledWith("qqbot:default::qq:c2c:OPENID123", "产品海报");
+    expect(sessionStore.updateConversationProvider).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      "chatgpt-desktop"
+    );
+    expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      BridgeSessionStatus.Active,
+      null
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("下次消息将继续该对话")
       })
     );
   });
@@ -1130,10 +1326,47 @@ describe("thread command handler", () => {
 
     expect(desktopDriver.createThread).not.toHaveBeenCalled();
     expect(chatgptDriver.newChat).toHaveBeenCalledWith("qqbot:default::qq:c2c:OPENID123");
+    expect(sessionStore.updateConversationProvider).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      "chatgpt-desktop"
+    );
+    expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      BridgeSessionStatus.Active,
+      null
+    );
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
         text: expect.stringContaining("已为本会话新建 ChatGPT 对话")
       })
+    );
+  });
+
+  it("switches /cgpt new to the ChatGPT source for following messages", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    const desktopDriver = createDriver();
+    const chatgptDriver = createChatgptDriver();
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      desktopDriver,
+      qqEgress,
+      chatgptDriver: chatgptDriver as never
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/cgpt new"))).resolves.toBe(true);
+
+    expect(chatgptDriver.newChat).toHaveBeenCalledWith("qqbot:default::qq:c2c:OPENID123");
+    expect(sessionStore.updateConversationProvider).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      "chatgpt-desktop"
+    );
+    expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      BridgeSessionStatus.Active,
+      null
     );
   });
 
@@ -1275,6 +1508,11 @@ describe("thread command handler", () => {
       "qqbot:default::qq:c2c:OPENID123",
       "codex-thread:page-1:new"
     );
+    expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      BridgeSessionStatus.Active,
+      null
+    );
     expect(sessionStore.updateSkillContextKey).toHaveBeenCalledWith(
       "qqbot:default::qq:c2c:OPENID123",
       null
@@ -1342,6 +1580,11 @@ describe("thread command handler", () => {
     expect(desktopDriver.createThread).toHaveBeenCalledWith(
       "qqbot:default::qq:c2c:OPENID123",
       expect.stringContaining("用户：用户问题 1")
+    );
+    expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+      "qqbot:default::qq:c2c:OPENID123",
+      BridgeSessionStatus.Active,
+      null
     );
   });
 });

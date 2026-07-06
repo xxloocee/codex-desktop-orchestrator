@@ -36,6 +36,7 @@ export interface DesktopDriverPort {
     binding: DriverBinding,
     options?: ConversationRunOptions
   ): Promise<OutboundDraft[]>;
+  compactThread?(binding: DriverBinding): Promise<void>;
   interruptActiveTurn?(sessionKey: string): Promise<boolean>;
   markSessionBroken(sessionKey: string, reason: string): Promise<void>;
 }

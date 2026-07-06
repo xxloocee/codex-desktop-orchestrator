@@ -36,7 +36,7 @@ describe("media context", () => {
     expect(text).not.toContain("[report.txt](/tmp/qq-media/report.txt)");
   });
 
-  it("does not inject qqbot runtime guidance into user text", () => {
+  it("injects a compact qq media marker as hidden context", () => {
     const text = buildCodexInboundText({
       messageId: "msg-qqbot-skill",
       accountKey: "qqbot:default",
@@ -48,9 +48,10 @@ describe("media context", () => {
       receivedAt: "2026-04-09T18:00:00.000Z"
     });
 
-    expect(text).toBe("请把图片和音频发给我");
+    expect(text).toContain("请把图片和音频发给我");
+    expect(text).toContain("<!-- QQ_MEDIA");
+    expect(text).toContain("<qqmedia>absolute-path-or-url</qqmedia>");
     expect(text).not.toContain("QQBOT_RUNTIME_CONTEXT");
-    expect(text).not.toContain("<qqmedia>");
     expect(text).not.toContain("[QQBot运行说明]");
   });
 

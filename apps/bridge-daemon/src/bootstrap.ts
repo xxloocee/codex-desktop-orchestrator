@@ -18,6 +18,7 @@ import { BridgeOrchestrator } from "../../../packages/orchestrator/src/bridge-or
 import { buildCodexInboundText } from "../../../packages/orchestrator/src/media-context.js";
 import { formatQqOutboundDraft } from "../../../packages/orchestrator/src/qq-outbound-format.js";
 import { enrichQqOutboundDraft } from "../../../packages/orchestrator/src/qq-outbound-draft.js";
+import { shouldInjectQqbotSkillContext } from "../../../packages/orchestrator/src/qqbot-skill-context.js";
 import { formatWeixinOutboundDraft } from "../../../packages/orchestrator/src/weixin-outbound-format.js";
 import type {
   ConversationProviderPort,
@@ -25,7 +26,7 @@ import type {
   DesktopDriverPort
 } from "../../../packages/ports/src/conversation.js";
 import type { ChatEgressPort } from "../../../packages/ports/src/chat.js";
-import type { DriverBinding } from "../../../packages/domain/src/driver.js";
+import { DesktopDriverError, type DriverBinding } from "../../../packages/domain/src/driver.js";
 import { SqliteTranscriptStore } from "../../../packages/store/src/message-repo.js";
 import { SqliteSessionStore } from "../../../packages/store/src/session-repo.js";
 import { SqliteTurnStore } from "../../../packages/store/src/turn-repo.js";
@@ -194,41 +195,78 @@ export function bootstrap() {
           currentBinding,
           ...(config.codexDesktop.cwd ? [{ cwd: config.codexDesktop.cwd }] : [])
         );
+        const skillContextKey = shouldInjectQqbotSkillContext(message)
+          ? `${binding.codexThreadRef ?? "unbound"}:qq-media-marker-v1`
+          : null;
+        const shouldIncludeSkillContext =
+          skillContextKey !== null && session?.skillContextKey !== skillContextKey;
         const threadRef = binding.codexThreadRef ?? message.sessionKey;
         return threadLockStore.withThreadLock(
           threadRef,
           async () => {
             await options?.onStarted?.();
-            await adapters.codexDesktop.sendUserMessage(binding, {
-              ...message,
-              text: buildCodexInboundText(message, {
-                includeSkillContext: false
-              })
+            const inboundText = buildCodexInboundText(message, {
+              includeSkillContext: shouldIncludeSkillContext
             });
-            const stableBinding = await resolveStableBinding(adapters.codexDesktop, binding);
-            if (session?.codexThreadRef !== stableBinding.codexThreadRef) {
-              await sessionStore.updateBinding(message.sessionKey, stableBinding.codexThreadRef);
-            }
-            await options?.onThreadBound?.(stableBinding.codexThreadRef);
-            const drafts = await adapters.codexDesktop.collectAssistantReply(stableBinding, {
-              onDraft: options?.onDraft
-                ? async (draft) => {
-                    await options.onDraft!({
-                      ...draft,
-                      replyToMessageId: message.messageId
-                    });
-                  }
-                : undefined,
-              onTurnEvent: async (event) => {
-                await postTurnEvent(config.runtime.listenPort, {
-                  ...event,
-                  payload: {
-                    ...event.payload,
-                    replyToMessageId: message.messageId
-                  }
-                });
+            let persistedCodexThreadRef = session?.codexThreadRef ?? null;
+            let persistedSkillContextKey = session?.skillContextKey ?? null;
+            const persistStableBinding = async (targetBinding: DriverBinding) => {
+              if (persistedCodexThreadRef !== targetBinding.codexThreadRef) {
+                await sessionStore.updateBinding(message.sessionKey, targetBinding.codexThreadRef);
+                persistedCodexThreadRef = targetBinding.codexThreadRef;
               }
-            });
+              if (shouldIncludeSkillContext) {
+                const nextSkillContextKey = `${targetBinding.codexThreadRef ?? "unbound"}:qq-media-marker-v1`;
+                if (persistedSkillContextKey !== nextSkillContextKey) {
+                  await sessionStore.updateSkillContextKey(
+                    message.sessionKey,
+                    nextSkillContextKey
+                  );
+                  persistedSkillContextKey = nextSkillContextKey;
+                }
+              }
+            };
+            const runBoundTurn = async (targetBinding: DriverBinding) => {
+              await adapters.codexDesktop.sendUserMessage(targetBinding, {
+                ...message,
+                text: inboundText
+              });
+              await persistStableBinding(targetBinding);
+              return adapters.codexDesktop.collectAssistantReply(targetBinding, {
+                onDraft: options?.onDraft
+                  ? async (draft) => {
+                      await options.onDraft!({
+                        ...draft,
+                        replyToMessageId: message.messageId
+                      });
+                    }
+                  : undefined,
+                onTurnEvent: async (event) => {
+                  await postTurnEvent(config.runtime.listenPort, {
+                    ...event,
+                    payload: {
+                      ...event.payload,
+                      replyToMessageId: message.messageId
+                    }
+                  });
+                }
+              });
+            };
+
+            let stableBinding = await resolveStableBinding(adapters.codexDesktop, binding);
+            await options?.onThreadBound?.(stableBinding.codexThreadRef);
+
+            let drafts;
+            try {
+              drafts = await runBoundTurn(stableBinding);
+            } catch (error) {
+              if (!isContextLengthExceeded(error) || !hasCompactThread(adapters.codexDesktop)) {
+                throw error;
+              }
+              await adapters.codexDesktop.compactThread(stableBinding);
+              stableBinding = await resolveStableBinding(adapters.codexDesktop, stableBinding);
+              drafts = await runBoundTurn(stableBinding);
+            }
             return drafts.map((draft) => ({
               ...draft,
               replyToMessageId: message.messageId
@@ -395,6 +433,16 @@ export { INTERNAL_TURN_EVENT_PATH };
 
 function safePathSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, "_") || "default";
+}
+
+function isContextLengthExceeded(error: unknown): boolean {
+  return error instanceof DesktopDriverError && error.reason === "context_length_exceeded";
+}
+
+function hasCompactThread(
+  driver: DesktopDriverPort
+): driver is DesktopDriverPort & { compactThread(binding: DriverBinding): Promise<void> } {
+  return typeof driver.compactThread === "function";
 }
 
 function accountKeyFromSessionKey(sessionKey: string): string | null {

@@ -156,9 +156,7 @@ describe("codex app-server driver", () => {
     expect(threadStartRequests[0]).toMatchObject({
       method: "thread/start",
       params: {
-        cwd: "D:/Project/demo",
-        experimentalRawEvents: false,
-        persistExtendedHistory: true
+        cwd: "D:/Project/demo"
       }
     });
     expect(binding.codexThreadRef).toMatch(/^codex-app-thread:thread-new:/);
@@ -461,6 +459,59 @@ describe("codex app-server driver", () => {
     });
   });
 
+  it("starts native app-server compaction and waits for compacted notification", async () => {
+    const socket = new FakeAppServerSocket();
+    const compactStart = vi.fn((message: Record<string, unknown>) => {
+      socket.respond(message.id, {});
+      socket.notify("thread/compacted", {
+        threadId: "thread-target",
+        turnId: "compact-turn-1"
+      });
+    });
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("thread/compact/start", compactStart);
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      replyTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+
+    await expect(driver.compactThread({
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    })).resolves.toBeUndefined();
+
+    expect(compactStart).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "thread/compact/start",
+        params: {
+          threadId: "thread-target"
+        }
+      })
+    );
+  });
+
   it("forwards app-server notifications to the desktop app ui in thread order", async () => {
     const socket = new FakeAppServerSocket();
     const forwarded: Array<{ method: string; params: unknown }> = [];
@@ -680,6 +731,101 @@ describe("codex app-server driver", () => {
         (message as { method?: string; params?: unknown }).method === "turn/interrupt"
       )
     ).toBe(true);
+  });
+
+  it("does not apply a default whole-turn reply timeout", async () => {
+    vi.useFakeTimers();
+    const socket = new FakeAppServerSocket();
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("turn/start", (message) => {
+      socket.respond(message.id, {
+        turn: {
+          id: "turn-target"
+        }
+      });
+    });
+    socket.onRequest("turn/interrupt", (message) => {
+      socket.respond(message.id, {});
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+    const binding = {
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    };
+
+    await driver.sendUserMessage(binding, {
+      messageId: "msg-1",
+      accountKey: "qqbot:default",
+      sessionKey: binding.sessionKey,
+      peerKey: "qq:c2c:user-1",
+      chatType: "c2c",
+      senderId: "user-1",
+      text: "hello",
+      receivedAt: "2026-04-21T14:30:00.000Z"
+    });
+
+    const reply = driver.collectAssistantReply(binding);
+    await vi.advanceTimersByTimeAsync(10 * 60_000 + 1);
+    expect(
+      socket.sent.some((message) =>
+        (message as { method?: string }).method === "turn/interrupt"
+      )
+    ).toBe(false);
+
+    socket.notify("item/agentMessage/delta", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      itemId: "item-target",
+      delta: "still ok"
+    });
+    socket.notify("item/completed", {
+      threadId: "thread-target",
+      turnId: "turn-target",
+      item: {
+        type: "agentMessage",
+        id: "item-target",
+        text: "still ok",
+        phase: "final_answer"
+      }
+    });
+    socket.notify("turn/completed", {
+      threadId: "thread-target",
+      turn: {
+        id: "turn-target",
+        status: "completed"
+      }
+    });
+
+    await expect(reply).resolves.toEqual([
+      expect.objectContaining({
+        text: "still ok"
+      })
+    ]);
+    vi.useRealTimers();
   });
 
   it("interrupts the active app-server turn for a session", async () => {

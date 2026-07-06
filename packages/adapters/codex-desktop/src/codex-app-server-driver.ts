@@ -138,6 +138,11 @@ type TurnCompletedParams = {
   };
 };
 
+type ContextCompactedParams = {
+  threadId?: string;
+  turnId?: string;
+};
+
 type PendingTurn = {
   sessionKey: string;
   threadId: string;
@@ -223,6 +228,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
   >();
   private readonly pendingTurnsBySession = new Map<string, PendingTurn>();
   private readonly pendingTurnsByKey = new Map<string, PendingTurn>();
+  private readonly pendingCompactionsByThread = new Map<string, () => void>();
   private notificationForwardTail: Promise<void> = Promise.resolve();
   private lastNotificationForwardErrorAt = 0;
 
@@ -235,9 +241,9 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       ?? resolveDefaultCodexBinaryPath();
     this.defaultCwd = normalizeCwd(options.defaultCwd ?? process.env.CODEX_WORKSPACE_CWD ?? null);
     this.connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
-    this.replyTimeoutMs = options.replyTimeoutMs ?? 10 * 60_000;
+    this.replyTimeoutMs = options.replyTimeoutMs ?? 0;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
-    this.staleTurnInterruptMs = options.staleTurnInterruptMs ?? this.replyTimeoutMs;
+    this.staleTurnInterruptMs = options.staleTurnInterruptMs ?? 10 * 60_000;
     this.toolSilenceTimeoutMs =
       options.toolSilenceTimeoutMs
       ?? parseOptionalPositiveInteger(process.env.CODEX_TOOL_SILENCE_TIMEOUT_MS)
@@ -413,9 +419,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
   ): Promise<DriverBinding> {
     await this.ensureConnected();
     const response = await this.request<{ thread?: ThreadRecord }>("thread/start", {
-      cwd: this.resolveCwd(options.cwd),
-      experimentalRawEvents: false,
-      persistExtendedHistory: true
+      cwd: this.resolveCwd(options.cwd)
     });
     const thread = response.thread;
     if (!thread?.id) {
@@ -456,10 +460,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       throw new DesktopDriverError("Codex app-server thread binding is missing", "session_not_found");
     }
 
-    await this.request("thread/resume", {
-      threadId,
-      persistExtendedHistory: true
-    }).catch(() => undefined);
+    await this.request("thread/resume", { threadId }).catch(() => undefined);
     await this.interruptStaleRunningTurn(threadId);
     await this.forwardThreadSnapshotToApp(threadId);
 
@@ -498,14 +499,17 @@ export class CodexAppServerDriver implements DesktopDriverPort {
 
     let result: AppServerTurnResult;
     try {
-      result = await withTimeout(
-        (async () => {
-          await this.flushBufferedTurnEvents(pending);
-          return pending.promise;
-        })(),
-        this.replyTimeoutMs,
-        "Codex app-server reply did not arrive before timeout"
-      );
+      const pendingResult = (async () => {
+        await this.flushBufferedTurnEvents(pending);
+        return pending.promise;
+      })();
+      result = this.replyTimeoutMs > 0
+        ? await withTimeout(
+            pendingResult,
+            this.replyTimeoutMs,
+            "Codex app-server reply did not arrive before timeout"
+          )
+        : await pendingResult;
     } catch (error) {
       if (!(error instanceof DesktopDriverError && error.reason === "turn_cancelled")) {
         await this.interruptTurn(pending.threadId, pending.turnId).catch(() => undefined);
@@ -545,6 +549,20 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       new DesktopDriverError("Codex app-server turn was cancelled", "turn_cancelled")
     );
     return true;
+  }
+
+  async compactThread(binding: DriverBinding): Promise<void> {
+    await this.ensureConnected();
+    const threadId = await this.resolveThreadId(binding.codexThreadRef);
+    if (!threadId) {
+      throw new DesktopDriverError("Codex app-server thread binding is missing", "session_not_found");
+    }
+
+    await this.request("thread/resume", { threadId }).catch(() => undefined);
+    await this.forwardThreadSnapshotToApp(threadId);
+    await this.waitForThreadCompaction(threadId);
+    await this.request("thread/resume", { threadId }).catch(() => undefined);
+    await this.forwardThreadSnapshotToApp(threadId);
   }
 
   async markSessionBroken(_sessionKey: string, _reason: string): Promise<void> {
@@ -806,6 +824,11 @@ export class CodexAppServerDriver implements DesktopDriverPort {
           error: error instanceof Error ? error.message : String(error)
         });
       });
+      return;
+    }
+
+    if (method === "thread/compacted") {
+      this.handleThreadCompacted(params as ContextCompactedParams);
     }
   }
 
@@ -939,6 +962,37 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       finalText,
       mediaReferences: extractMediaReferences(finalText)
     });
+  }
+
+  private handleThreadCompacted(params: ContextCompactedParams): void {
+    if (!params.threadId) {
+      return;
+    }
+
+    const resolve = this.pendingCompactionsByThread.get(params.threadId);
+    if (!resolve) {
+      return;
+    }
+
+    this.pendingCompactionsByThread.delete(params.threadId);
+    resolve();
+  }
+
+  private async waitForThreadCompaction(threadId: string): Promise<void> {
+    const compacted = new Promise<void>((resolve) => {
+      this.pendingCompactionsByThread.set(threadId, resolve);
+    });
+
+    try {
+      await this.request("thread/compact/start", { threadId });
+      await withTimeout(
+        compacted,
+        this.requestTimeoutMs,
+        "Codex app-server thread compaction did not finish before timeout"
+      );
+    } finally {
+      this.pendingCompactionsByThread.delete(threadId);
+    }
   }
 
   private findPendingTurn(

@@ -26,6 +26,10 @@ export class SqliteTranscriptStore implements TranscriptStorePort {
         JSON.stringify(message),
         message.receivedAt
       );
+
+    this.db
+      .prepare(`UPDATE bridge_sessions SET last_inbound_at = ? WHERE session_key = ?`)
+      .run(message.receivedAt, message.sessionKey);
   }
 
   async recordOutbound(draft: OutboundDraft): Promise<void> {
@@ -43,6 +47,10 @@ export class SqliteTranscriptStore implements TranscriptStorePort {
         draft.createdAt,
         draft.createdAt
       );
+
+    this.db
+      .prepare(`UPDATE bridge_sessions SET last_outbound_at = ? WHERE session_key = ?`)
+      .run(draft.createdAt, draft.sessionKey);
   }
 
   async hasInbound(messageId: string): Promise<boolean> {

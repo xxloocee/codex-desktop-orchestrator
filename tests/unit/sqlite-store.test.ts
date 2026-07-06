@@ -243,6 +243,54 @@ describe("sqlite store", () => {
     });
   });
 
+  it("updates session activity timestamps from inbound and outbound records", async () => {
+    const db = createTempDb();
+    const sessionStore = new SqliteSessionStore(db);
+    const transcriptStore = new SqliteTranscriptStore(db);
+    const sessionKey = buildSessionKey({
+      accountKey: "qqbot:default",
+      peerKey: buildPeerKey({ chatType: "c2c", peerId: "abc-activity" })
+    });
+
+    await sessionStore.createSession({
+      sessionKey,
+      accountKey: "qqbot:default",
+      peerKey: "qq:c2c:abc-activity",
+      chatType: "c2c",
+      peerId: "abc-activity",
+      codexThreadRef: null,
+      lastCodexTurnId: null,
+      skillContextKey: null,
+      conversationProvider: null,
+      status: BridgeSessionStatus.Active,
+      lastInboundAt: null,
+      lastOutboundAt: null,
+      lastError: null
+    });
+
+    await transcriptStore.recordInbound({
+      messageId: "msg-activity-1",
+      accountKey: "qqbot:default",
+      sessionKey,
+      peerKey: "qq:c2c:abc-activity",
+      chatType: "c2c",
+      senderId: "abc-activity",
+      text: "ping",
+      receivedAt: "2026-07-04T15:11:37.000Z"
+    });
+    await transcriptStore.recordOutbound({
+      draftId: "draft-activity-1",
+      sessionKey,
+      text: "pong",
+      createdAt: "2026-07-04T15:11:40.000Z"
+    });
+
+    await expect(sessionStore.getSession(sessionKey)).resolves.toMatchObject({
+      lastInboundAt: "2026-07-04T15:11:37.000Z",
+      lastOutboundAt: "2026-07-04T15:11:40.000Z"
+    });
+  });
+
   it("updates and looks up turn bindings after codex binding is resolved", async () => {
     const db = createTempDb();
     const turnStore = new SqliteTurnStore(db);

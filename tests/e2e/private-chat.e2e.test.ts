@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { DesktopDriverError } from "../../packages/domain/src/driver.js";
 import { MediaArtifactKind } from "../../packages/domain/src/message.js";
+import type { DesktopDriverPort } from "../../packages/ports/src/conversation.js";
 import { bootstrap } from "../../apps/bridge-daemon/src/bootstrap.js";
 import { createIngressMessageHandler } from "../../apps/bridge-daemon/src/main.js";
 import { ThreadCommandHandler } from "../../apps/bridge-daemon/src/thread-command-handler.js";
@@ -305,6 +307,80 @@ describe("bootstrap integration", () => {
     }
   });
 
+  it("compacts the bound Codex thread and retries when app-server reports context length exceeded", async () => {
+    process.env.QQBOT_APP_ID = "app-id";
+    process.env.QQBOT_CLIENT_SECRET = "secret";
+    process.env.QQ_CODEX_DATABASE_PATH = ":memory:";
+    process.env.CODEX_REMOTE_DEBUGGING_PORT = "9229";
+
+    const app = bootstrap();
+    try {
+      let collectCalls = 0;
+      const sendUserMessage = vi
+        .spyOn(app.adapters.codexDesktop, "sendUserMessage")
+        .mockResolvedValue(undefined);
+      const compactThread = vi
+        .fn<NonNullable<DesktopDriverPort["compactThread"]>>()
+        .mockResolvedValue(undefined);
+      app.adapters.codexDesktop.compactThread = compactThread;
+
+      vi.spyOn(app.adapters.codexDesktop, "ensureAppReady").mockResolvedValue(undefined);
+      vi.spyOn(app.adapters.codexDesktop, "openOrBindSession").mockResolvedValue({
+        sessionKey: "qqbot:default::qq:c2c:compact",
+        codexThreadRef: "codex-app-thread:thread-needs-compact"
+      });
+      vi.spyOn(app.adapters.codexDesktop, "collectAssistantReply").mockImplementation(async (binding) => {
+        collectCalls += 1;
+        if (collectCalls === 1) {
+          throw new DesktopDriverError(
+            "Codex app-server turn failed: context_length_exceeded",
+            "context_length_exceeded"
+          );
+        }
+
+        return [
+          {
+            draftId: "draft-after-compact",
+            turnId: "turn-after-compact",
+            sessionKey: binding.sessionKey,
+            text: "compact retry ok",
+            createdAt: "2026-07-01T11:05:00.000Z"
+          }
+        ];
+      });
+      const deliveredTexts: string[] = [];
+      vi.spyOn(app.adapters.qq.egress, "deliver").mockImplementation(async (draft) => {
+        deliveredTexts.push(draft.text);
+        return {
+          jobId: draft.draftId,
+          sessionKey: draft.sessionKey,
+          providerMessageId: null,
+          deliveredAt: draft.createdAt
+        };
+      });
+
+      await expect(app.orchestrator.handleInbound({
+        messageId: "msg-compact-1",
+        accountKey: "qqbot:default",
+        sessionKey: "qqbot:default::qq:c2c:compact",
+        peerKey: "qq:c2c:compact",
+        chatType: "c2c",
+        senderId: "compact",
+        text: "continue in the native thread",
+        receivedAt: "2026-07-01T11:05:00.000Z"
+      })).resolves.toBeUndefined();
+
+      expect(compactThread).toHaveBeenCalledWith({
+        sessionKey: "qqbot:default::qq:c2c:compact",
+        codexThreadRef: "codex-app-thread:thread-needs-compact"
+      });
+      expect(sendUserMessage).toHaveBeenCalledTimes(2);
+      expect(deliveredTexts).toContain("compact retry ok");
+    } finally {
+      app.db.close();
+    }
+  });
+
   it("uses the newly selected thread binding for the next qq message after /tu", async () => {
     process.env.QQBOT_APP_ID = "app-id";
     process.env.QQBOT_CLIENT_SECRET = "secret";
@@ -429,7 +505,7 @@ describe("bootstrap integration", () => {
           | undefined;
 
       expect(stored?.codexThreadRef).toBe("codex-app-thread:thread-b:bbb");
-      expect(stored?.skillContextKey).toBeNull();
+      expect(stored?.skillContextKey).toBe("codex-app-thread:thread-b:bbb:qq-media-marker-v1");
       expect(stored?.lastCodexTurnId).toBe("turn-after-switch");
     } finally {
       app.db.close();

@@ -1,5 +1,8 @@
 import type { InboundMessage, MediaArtifact } from "../../domain/src/message.js";
 
+const QQ_MEDIA_MARKER =
+  "QQ_MEDIA: declare QQ media attachments with <qqmedia>absolute-path-or-url</qqmedia>; the bridge consumes these tags, so keep user-facing text outside the tags.";
+
 export function buildCodexInboundText(
   message: InboundMessage,
   options: { includeSkillContext?: boolean } = {}
@@ -16,6 +19,10 @@ export function buildCodexInboundText(
 
   if (attachmentContextArtifacts.length > 0) {
     hiddenContexts.push(buildHiddenAttachmentContext(attachmentContextArtifacts));
+  }
+
+  if ((options.includeSkillContext ?? true) && shouldInjectQqbotSkillContext(message)) {
+    hiddenContexts.push(wrapHiddenContext("QQ_MEDIA", QQ_MEDIA_MARKER));
   }
 
   if (hiddenContexts.length > 0) {
@@ -55,6 +62,10 @@ function buildHiddenAttachmentContext(artifacts: MediaArtifact[]): string {
 
 function wrapHiddenContext(label: string, content: string): string {
   return [`<!-- ${label}`, content, "-->"].join("\n");
+}
+
+function shouldInjectQqbotSkillContext(message: InboundMessage): boolean {
+  return message.accountKey.startsWith("qqbot:");
 }
 
 function inferAttachmentOnlyPlaceholder(message: InboundMessage): string {

@@ -161,7 +161,17 @@ export class RetryableDeliveryError extends Error {
 }
 
 function isRetryableDeliveryError(error: unknown): boolean {
-  return error instanceof RetryableDeliveryError;
+  if (error instanceof RetryableDeliveryError || error instanceof DeliveryTimeoutError) {
+    return true;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  const statusMatch = message.match(/\b(?:408|425|429|5\d\d)\b/);
+  if (statusMatch) {
+    return true;
+  }
+
+  return /\b(?:fetch failed|network|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up)\b/i.test(message);
 }
 
 export async function markSynchronousDeliveryResult(

@@ -209,6 +209,8 @@ export class ThreadCommandHandler {
         }
         // 写入当前对话标题，下次 run() 检测到后跳过 clickNewChat
         cgDriver.markSwitched(message.sessionKey, target.title);
+        await this.deps.sessionStore.updateConversationProvider(message.sessionKey, "chatgpt-desktop");
+        await this.deps.sessionStore.updateSessionStatus(message.sessionKey, BridgeSessionStatus.Active, null);
         await this.deliverControlReply(message, `已切换到 ChatGPT 对话：${target.title}\n下次消息将继续该对话。`);
         return;
       }
@@ -274,6 +276,11 @@ export class ThreadCommandHandler {
         return;
       }
 
+      if (text === "/代码审查") {
+        await this.handleCodeReviewCommand(message);
+        return;
+      }
+
       const useMatch = text.match(/^(?:\/thread\s+use|\/tu)\s+(\d+)$/);
       if (useMatch) {
         const index = Number(useMatch[1]);
@@ -303,6 +310,7 @@ export class ThreadCommandHandler {
           throw error;
         }
         await this.deps.sessionStore.updateBinding(message.sessionKey, binding.codexThreadRef);
+        await this.deps.sessionStore.updateSessionStatus(message.sessionKey, BridgeSessionStatus.Active, null);
         await this.deps.sessionStore.updateSkillContextKey(message.sessionKey, null);
         await this.deliverControlReply(
           message,
@@ -328,6 +336,7 @@ export class ThreadCommandHandler {
           this.buildNewThreadSeedPrompt(title)
         );
         await this.deps.sessionStore.updateBinding(message.sessionKey, binding.codexThreadRef);
+        await this.deps.sessionStore.updateSessionStatus(message.sessionKey, BridgeSessionStatus.Active, null);
         await this.deliverControlReply(message, `已创建并切换到新线程：${title}`);
         return;
       }
@@ -351,6 +360,7 @@ export class ThreadCommandHandler {
         );
         await this.deps.sessionStore.updateConversationProvider(message.sessionKey, "codex-desktop");
         await this.deps.sessionStore.updateBinding(message.sessionKey, binding.codexThreadRef);
+        await this.deps.sessionStore.updateSessionStatus(message.sessionKey, BridgeSessionStatus.Active, null);
         await this.deps.sessionStore.updateSkillContextKey(message.sessionKey, null);
         await this.deliverControlReply(
           message,
@@ -381,6 +391,7 @@ export class ThreadCommandHandler {
           this.buildForkThreadSeedPrompt(title, recentConversation)
         );
         await this.deps.sessionStore.updateBinding(message.sessionKey, binding.codexThreadRef);
+        await this.deps.sessionStore.updateSessionStatus(message.sessionKey, BridgeSessionStatus.Active, null);
         await this.deliverControlReply(message, `已根据最近几轮对话 fork 新线程：${title}`);
         return;
       }
@@ -438,6 +449,7 @@ export class ThreadCommandHandler {
       text === "/q" ||
       text === "/status" ||
       text === "/st" ||
+      text === "/代码审查" ||
       /^\/thread\s+use\s+\d+$/.test(text) ||
       /^\/tu\s+\d+$/.test(text) ||
       /^\/model\s+use\s+.+$/.test(text) ||
@@ -600,6 +612,8 @@ export class ThreadCommandHandler {
       return;
     }
     cgDriver.markSwitched(message.sessionKey, target.title);
+    await this.deps.sessionStore.updateConversationProvider(message.sessionKey, "chatgpt-desktop");
+    await this.deps.sessionStore.updateSessionStatus(message.sessionKey, BridgeSessionStatus.Active, null);
     await this.deliverControlReply(message, `已切换到 ChatGPT 对话：${target.title}\n下次消息将继续该对话。`);
   }
 
@@ -637,6 +651,8 @@ export class ThreadCommandHandler {
       return;
     }
     cgDriver.newChat(session?.sessionKey ?? message.sessionKey);
+    await this.deps.sessionStore.updateConversationProvider(message.sessionKey, "chatgpt-desktop");
+    await this.deps.sessionStore.updateSessionStatus(message.sessionKey, BridgeSessionStatus.Active, null);
     await this.deliverControlReply(message, "已为本会话新建 ChatGPT 对话，下条消息将从新对话开始。");
   }
 
@@ -649,6 +665,10 @@ export class ThreadCommandHandler {
       replyToMessageId: message.messageId
     };
 
+    await this.deliverDraft(draft);
+  }
+
+  private async deliverDraft(draft: OutboundDraft): Promise<void> {
     await this.deps.transcriptStore.recordOutbound(draft);
     try {
       const delivery = await this.deps.qqEgress.deliver(draft);
@@ -656,6 +676,44 @@ export class ThreadCommandHandler {
     } catch (error) {
       await markSynchronousDeliveryFailure(this.deps.deliveryJobStore, draft, error);
       throw error;
+    }
+  }
+
+  private async handleCodeReviewCommand(message: InboundMessage): Promise<void> {
+    const session = await this.deps.sessionStore.getSession(message.sessionKey);
+    const currentBinding = session
+      && session.status === BridgeSessionStatus.Active
+      ? {
+          sessionKey: session.sessionKey,
+          codexThreadRef: session.codexThreadRef
+        }
+      : null;
+    const binding = await this.deps.desktopDriver.openOrBindSession(
+      message.sessionKey,
+      currentBinding
+    );
+
+    if (session?.codexThreadRef !== binding.codexThreadRef) {
+      await this.deps.sessionStore.updateBinding(message.sessionKey, binding.codexThreadRef);
+    }
+    await this.deps.sessionStore.updateSessionStatus(message.sessionKey, BridgeSessionStatus.Active, null);
+
+    await this.deps.desktopDriver.sendUserMessage(binding, {
+      ...message,
+      text: "/审查"
+    });
+
+    const drafts = await this.deps.desktopDriver.collectAssistantReply(binding);
+    if (drafts.length === 0) {
+      await this.deliverControlReply(message, "已触发 Codex 代码审查。");
+      return;
+    }
+
+    for (const draft of drafts) {
+      await this.deliverDraft({
+        ...draft,
+        replyToMessageId: draft.replyToMessageId ?? message.messageId
+      });
     }
   }
 
@@ -673,6 +731,10 @@ export class ThreadCommandHandler {
         "| 查看当前对话源 | `/source` | - |",
         "| 查看账号状态 | `/accounts` | - |",
         "| 切换到 Codex Desktop | `/source codex` | - |",
+        "| 查看任务/投递状态 | `/tasks`、`/deliveries` | - |",
+        "| 取消当前任务 | `/cancel` | - |",
+        "| 查看/切换 ChatGPT 对话 | `/cgpt`、`/cgpt use <序号>` | - |",
+        "| 新建 ChatGPT 对话 | `/cgpt new` | - |",
         "| 查看帮助 | `/help` | `/h` |",
         "",
         "建议先发 `/t` 刷新并查看 ChatGPT 对话列表，再用 `/tu 2` 切换。",
@@ -694,9 +756,16 @@ export class ThreadCommandHandler {
       "| 切换模型 | `/model use <名称>` | `/mu <名称>` |",
       "| 查看额度信息 | `/quota` | `/q` |",
       "| 查看当前运行状态 | `/status` | `/st` |",
-      "| 查看帮助 | `/help` | `/h` |",
+      "| 调用 Codex 代码审查 | `/代码审查` | - |",
       "| 查看当前对话源 | `/source` | - |",
       "| 查看账号状态 | `/accounts` | - |",
+      "| 查看任务/投递状态 | `/tasks`、`/deliveries` | - |",
+      "| 取消当前任务 | `/cancel` | - |",
+      "| 查看项目/别名 | `/projects`、`/aliases` | - |",
+      "| 按项目新建 Codex 线程 | `/new <别名> <任务>` | - |",
+      "| 查看/切换 ChatGPT 对话 | `/cgpt`、`/cgpt use <序号>` | - |",
+      "| 新建 ChatGPT 对话 | `/cgpt new` | - |",
+      "| 查看帮助 | `/help` | `/h` |",
       "| 切换到 ChatGPT Desktop | `/source chatgpt` | - |",
       "| 切换到 Codex Desktop | `/source codex` | - |",
       "",

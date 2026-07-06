@@ -5,13 +5,20 @@ import {
 } from "../../adapters/qq/src/qq-media-parser.js";
 
 export function enrichQqOutboundDraft(draft: OutboundDraft): OutboundDraft {
-  const parsedArtifacts = parseQqMediaSegments(draft.text)
+  const segments = parseQqMediaSegments(draft.text);
+  const parsedArtifacts = segments
     .filter((segment) => segment.type === "media")
     .map((segment) => buildMediaArtifactFromReference(segment.reference));
   const mergedArtifacts = dedupeArtifacts([
     ...(draft.mediaArtifacts ?? []),
     ...parsedArtifacts
   ]);
+  const textWithoutMediaTags = segments
+    .filter((segment) => segment.type === "text")
+    .map((segment) => segment.text)
+    .join("")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
   if (mergedArtifacts.length === 0) {
     return draft;
@@ -19,6 +26,7 @@ export function enrichQqOutboundDraft(draft: OutboundDraft): OutboundDraft {
 
   return {
     ...draft,
+    text: textWithoutMediaTags,
     mediaArtifacts: mergedArtifacts
   };
 }

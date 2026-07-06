@@ -118,6 +118,34 @@ describe("delivery worker", () => {
     );
   });
 
+  it("marks transient http delivery failures for retry", async () => {
+    const job = createJob();
+    const deliver = vi.fn().mockRejectedValue(new Error("QQ message send failed: 500 upstream"));
+    const store: DeliveryJobStorePort = {
+      claimDueJobs: vi.fn().mockResolvedValue([job]),
+      markDelivered: vi.fn().mockResolvedValue(undefined),
+      markAttemptFailed: vi.fn().mockResolvedValue(undefined),
+      recoverInFlight: vi.fn().mockResolvedValue(0),
+      listJobs: vi.fn().mockResolvedValue([])
+    };
+    const worker = new DeliveryWorker({
+      store,
+      retryBackoffMs: 10_000,
+      maxAttempts: 3,
+      resolveEgress: () => ({ deliver })
+    });
+
+    await expect(worker.processDueJobs()).resolves.toBe(1);
+    expect(store.markAttemptFailed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: job.jobId,
+        error: "QQ message send failed: 500 upstream",
+        maxAttempts: 3,
+        retryAfterMs: 10_000
+      })
+    );
+  });
+
   it("marks unknown delivery errors as terminal failures", async () => {
     const job = createJob();
     const deliver = vi.fn().mockRejectedValue(new Error("socket closed"));
@@ -183,7 +211,7 @@ describe("delivery worker", () => {
       expect.objectContaining({
         jobId: stuckJob.jobId,
         error: "Delivery timed out after 5ms",
-        maxAttempts: stuckJob.attemptCount
+        maxAttempts: 3
       })
     );
 
@@ -268,6 +296,38 @@ describe("delivery worker", () => {
         jobId: draft.draftId,
         error: "socket closed",
         maxAttempts: 1
+      })
+    );
+  });
+
+  it("marks synchronous transient delivery failures for retry", async () => {
+    const draft: OutboundDraft = {
+      draftId: "draft-sync-transient",
+      sessionKey: "qqbot:default::qq:c2c:abc-123",
+      text: "reply",
+      createdAt: "2026-07-01T10:00:00.000Z"
+    };
+    const store: DeliveryJobStorePort = {
+      claimDueJobs: vi.fn().mockResolvedValue([]),
+      markDelivered: vi.fn().mockResolvedValue(undefined),
+      markAttemptFailed: vi.fn().mockResolvedValue(undefined),
+      recoverInFlight: vi.fn().mockResolvedValue(0),
+      listJobs: vi.fn().mockResolvedValue([])
+    };
+
+    await markSynchronousDeliveryFailure(
+      store,
+      draft,
+      new Error("Weixin message send failed: 429 rate limited"),
+      { maxAttempts: 4, retryBackoffMs: 10_000 }
+    );
+
+    expect(store.markAttemptFailed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: draft.draftId,
+        error: "Weixin message send failed: 429 rate limited",
+        maxAttempts: 4,
+        retryAfterMs: 10_000
       })
     );
   });
