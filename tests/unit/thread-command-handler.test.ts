@@ -874,11 +874,7 @@ describe("thread command handler", () => {
 
     await expect(handler.handleIfCommand(createPrivateMessage("/cancel"))).resolves.toBe(true);
 
-    expect(turnStore.updateStatus).toHaveBeenCalledWith(
-      "bridge-turn-1",
-      BridgeTurnStatus.Running,
-      "interrupt failed"
-    );
+    expect(turnStore.updateStatus).not.toHaveBeenCalled();
     expect(qqEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
         text: expect.stringContaining("Cancel failed for task")

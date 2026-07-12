@@ -227,6 +227,13 @@ export function bootstrap() {
               }
             };
             const runBoundTurn = async (targetBinding: DriverBinding) => {
+              const activeTurn = await turnStore.getCurrentTurn(message.sessionKey);
+              if (!activeTurn || activeTurn.qqMessageId !== message.messageId) {
+                throw new DesktopDriverError(
+                  "Bridge turn was cancelled before submit",
+                  "turn_cancelled"
+                );
+              }
               await adapters.codexDesktop.sendUserMessage(targetBinding, {
                 ...message,
                 text: inboundText
@@ -283,15 +290,27 @@ export function bootstrap() {
   };
 
   const chatgptProvider = new ChatgptDesktopProvider({ outDir: "runtime/media/chatgpt" });
+  const activeConversationRuns = new Map<
+    string,
+    { provider: "codex-desktop" | "chatgpt-desktop" }
+  >();
 
   const conversationProvider: ConversationProviderPort = {
     runTurn: async (message, options) => {
       const session = await sessionStore.getSession(message.sessionKey);
       const effectiveProvider = session?.conversationProvider ?? config.conversationProvider;
-      if (effectiveProvider === "chatgpt-desktop") {
-        return chatgptProvider.runTurn(message, options);
+      const activeRun = { provider: effectiveProvider };
+      activeConversationRuns.set(message.sessionKey, activeRun);
+      try {
+        if (effectiveProvider === "chatgpt-desktop") {
+          return await chatgptProvider.runTurn(message, options);
+        }
+        return await codexConversationProvider.runTurn(message, options);
+      } finally {
+        if (activeConversationRuns.get(message.sessionKey) === activeRun) {
+          activeConversationRuns.delete(message.sessionKey);
+        }
       }
-      return codexConversationProvider.runTurn(message, options);
     }
   };
 
@@ -308,7 +327,17 @@ export function bootstrap() {
       deliveryJobStore,
       conversationProvider,
       qqEgress: egress,
-      draftFormatter
+      draftFormatter,
+      turnTimeoutMs: config.runtime.turnTimeoutMs,
+      interruptTurn: async (sessionKey) => {
+        if (activeConversationRuns.get(sessionKey)?.provider !== "codex-desktop") {
+          return false;
+        }
+        if (!("interruptActiveTurn" in adapters.codexDesktop)) {
+          return false;
+        }
+        return adapters.codexDesktop.interruptActiveTurn(sessionKey);
+      }
     });
 
   const qqOrchestrators = Object.fromEntries(

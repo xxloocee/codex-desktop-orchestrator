@@ -11,6 +11,7 @@ import {
   markSynchronousDeliveryFailure,
   markSynchronousDeliveryResult
 } from "../../../packages/orchestrator/src/delivery-worker.js";
+import { TurnRecoveryController } from "../../../packages/orchestrator/src/turn-recovery-controller.js";
 import type { DeliveryJobStorePort, TranscriptStorePort } from "../../../packages/ports/src/store.js";
 import { authorizeInboundMessage, type AccessDecision } from "./access-control.js";
 import { bootstrap, INTERNAL_TURN_EVENT_PATH } from "./bootstrap.js";
@@ -114,11 +115,10 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
   const app = bootstrap();
   const paths = runtimePaths();
   const managementToken = ensureManagementToken(paths);
-  const recoveryReport = app.runtimeRecoveryStore.recoverAbandonedState();
-  appendRuntimeLog(
-    paths,
-    `recovery timedOutTurns=${recoveryReport.timedOutTurns} orphanedTurns=${recoveryReport.orphanedTurns} clearedSessionLocks=${recoveryReport.clearedSessionLocks} clearedThreadLocks=${recoveryReport.clearedThreadLocks} remainingActiveTurns=${recoveryReport.remainingActiveTurns}`
-  );
+  const recovery = new TurnRecoveryController({
+    runtimeRecoveryStore: app.runtimeRecoveryStore
+  }).recoverAbandonedState();
+  appendRuntimeLog(paths, recovery.logLine);
   const qqGatewayDisabled = process.env.QQ_CODEX_DISABLE_QQ_GATEWAY === "1"
     || process.env.QQ_CODEX_DISABLE_QQ_GATEWAY === "true";
   const managedServices: Array<Pick<WeixinGatewayServiceHandle, "shutdown">> = [];

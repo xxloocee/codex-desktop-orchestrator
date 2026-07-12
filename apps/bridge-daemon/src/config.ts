@@ -62,7 +62,8 @@ export const appConfigSchema = z.object({
   runtime: z.object({
     listenHost: z.string().min(1),
     listenPort: z.number().int().positive(),
-    webhookPath: z.string().startsWith("/")
+    webhookPath: z.string().startsWith("/"),
+    turnTimeoutMs: z.number().int().nonnegative()
   }),
   qqBot: qqBotConfigSchema,
   qqBots: z.array(qqBotConfigSchema).min(1),
@@ -109,7 +110,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       ...fileConfig.runtime,
       listenHost: env.QQ_CODEX_LISTEN_HOST ?? fileConfig.runtime?.listenHost ?? envConfig.runtime.listenHost,
       listenPort: Number(env.QQ_CODEX_LISTEN_PORT ?? fileConfig.runtime?.listenPort ?? envConfig.runtime.listenPort),
-      webhookPath: env.QQ_CODEX_WEBHOOK_PATH ?? fileConfig.runtime?.webhookPath ?? envConfig.runtime.webhookPath
+      webhookPath: env.QQ_CODEX_WEBHOOK_PATH ?? fileConfig.runtime?.webhookPath ?? envConfig.runtime.webhookPath,
+      turnTimeoutMs: Number(
+        env.QQ_CODEX_TURN_TIMEOUT_MS
+          ?? fileConfig.runtime?.turnTimeoutMs
+          ?? envConfig.runtime.turnTimeoutMs
+      )
     },
     qqBot: qqBots[0],
     qqBots,
@@ -166,7 +172,8 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): AppConfig {
     runtime: {
       listenHost: env.QQ_CODEX_LISTEN_HOST ?? "127.0.0.1",
       listenPort: Number(env.QQ_CODEX_LISTEN_PORT ?? "3100"),
-      webhookPath: env.QQ_CODEX_WEBHOOK_PATH ?? "/webhooks/qq"
+      webhookPath: env.QQ_CODEX_WEBHOOK_PATH ?? "/webhooks/qq",
+      turnTimeoutMs: Number(env.QQ_CODEX_TURN_TIMEOUT_MS ?? "1800000")
     },
     qqBot: fallbackQqBot,
     qqBots: resolveQqBotConfigs(env, fallbackQqBot),
@@ -217,7 +224,8 @@ function loadConfigFromEnvOrDefaults(env: NodeJS.ProcessEnv): AppConfig {
       runtime: {
         listenHost: env.QQ_CODEX_LISTEN_HOST ?? "127.0.0.1",
         listenPort: Number(env.QQ_CODEX_LISTEN_PORT ?? "3100"),
-        webhookPath: env.QQ_CODEX_WEBHOOK_PATH ?? "/webhooks/qq"
+        webhookPath: env.QQ_CODEX_WEBHOOK_PATH ?? "/webhooks/qq",
+        turnTimeoutMs: Number(env.QQ_CODEX_TURN_TIMEOUT_MS ?? "1800000")
       },
       qqBot: fallbackQqBot,
       qqBots: [fallbackQqBot],

@@ -9,7 +9,10 @@ import {
   type InboundMessage,
   type OutboundDraft
 } from "../../packages/domain/src/message.js";
-import type { ConversationProviderPort } from "../../packages/ports/src/conversation.js";
+import type {
+  ConversationProviderPort,
+  ConversationRunOptions
+} from "../../packages/ports/src/conversation.js";
 import type { QqEgressPort } from "../../packages/ports/src/qq.js";
 import type {
   DeliveryJobStorePort,
@@ -60,6 +63,8 @@ function createTurnStore(): TurnStorePort {
     attachCodexTurn: vi.fn().mockResolvedValue(undefined),
     updateCodexThreadRef: vi.fn().mockResolvedValue(undefined),
     updateStatus: vi.fn().mockResolvedValue(undefined),
+    markQueuedIfActive: vi.fn().mockResolvedValue(true),
+    markStreamingIfActive: vi.fn().mockResolvedValue(true),
     updateDeadline: vi.fn().mockResolvedValue(undefined),
     recordTurnEvent: vi.fn().mockResolvedValue(undefined),
     addDeliveredText: vi.fn().mockResolvedValue(undefined),
@@ -226,6 +231,7 @@ describe("BridgeOrchestrator", () => {
   it("records turn lifecycle state while processing an inbound message", async () => {
     const message = createMessage();
     const turnStore = createTurnStore();
+    turnStore.markTerminalIfActive = vi.fn().mockResolvedValue(true);
     const deliveryJobStore = createDeliveryJobStore();
     const transcriptStore: TranscriptStorePort = {
       hasInbound: vi.fn().mockResolvedValue(false),
@@ -305,15 +311,18 @@ describe("BridgeOrchestrator", () => {
       )
     ).toBe(false);
     expect(turnStore.updateStatus).toHaveBeenCalledWith(bridgeTurnId, BridgeTurnStatus.Running);
-    expect(turnStore.attachCodexTurn).toHaveBeenCalledWith(bridgeTurnId, "codex-turn-1");
-    expect(turnStore.updateStatus).toHaveBeenCalledWith(bridgeTurnId, BridgeTurnStatus.Streaming);
+    expect(turnStore.markStreamingIfActive).toHaveBeenCalledWith(
+      bridgeTurnId,
+      "codex-turn-1",
+      "2026-07-01T10:00:01.000Z"
+    );
     expect(turnStore.addDeliveredText).toHaveBeenCalledWith(bridgeTurnId, 5);
     expect(deliveryJobStore.markDelivered).toHaveBeenCalledWith({
       jobId: "draft-turn-1",
       deliveredAt: "2026-07-01T10:00:01.000Z",
       providerMessageId: null
     });
-    expect(turnStore.updateStatus).toHaveBeenLastCalledWith(
+    expect(turnStore.markTerminalIfActive).toHaveBeenCalledWith(
       bridgeTurnId,
       BridgeTurnStatus.Completed,
       null
@@ -432,9 +441,9 @@ describe("BridgeOrchestrator", () => {
 
     const turnPromise = orchestrator.handleInbound(message);
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(turnStore.updateStatus).toHaveBeenCalledWith(
+    expect(turnStore.markQueuedIfActive).toHaveBeenCalledWith(
       expect.any(String),
-      BridgeTurnStatus.Queued
+      true
     );
     releaseTurn.resolve();
     await expect(turnPromise).resolves.toBeUndefined();
@@ -560,9 +569,9 @@ describe("BridgeOrchestrator", () => {
 
     expect(enteredTurns).toEqual(["msg-1"]);
     const secondBridgeTurnId = vi.mocked(turnStore.createTurn).mock.calls[1]?.[0].turnId;
-    expect(turnStore.updateStatus).toHaveBeenCalledWith(
+    expect(turnStore.markQueuedIfActive).toHaveBeenCalledWith(
       secondBridgeTurnId,
-      BridgeTurnStatus.Queued
+      undefined
     );
 
     await orchestrator.handleTurnEvent({
@@ -1147,6 +1156,236 @@ describe("BridgeOrchestrator", () => {
     );
   });
 
+  it("marks a running turn timed out when the hard turn deadline expires", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const message = createMessage();
+      const turnStore = createTurnStore();
+      const deferred = createDeferred<OutboundDraft[]>();
+
+      const transcriptStore: TranscriptStorePort = {
+        hasInbound: vi.fn().mockResolvedValue(false),
+        recordInbound: vi.fn(),
+        recordOutbound: vi.fn(),
+        listRecentConversation: vi.fn().mockResolvedValue([])
+      };
+      const sessionStore: SessionStorePort = {
+        getSession: vi.fn().mockResolvedValue(null),
+        createSession: vi.fn(),
+        updateSessionStatus: vi.fn(),
+        updateBinding: vi.fn(),
+        updateLastCodexTurnId: vi.fn(),
+        updateSkillContextKey: vi.fn(),
+        updateConversationProvider: vi.fn(),
+        withSessionLock: vi.fn(async (_sessionKey, work) => work())
+      };
+      const conversationProvider: ConversationProviderPort = {
+        runTurn: vi.fn().mockReturnValue(deferred.promise)
+      };
+      const qqEgress: QqEgressPort = {
+        deliver: vi.fn(async (draft: OutboundDraft) => ({
+          jobId: draft.draftId,
+          sessionKey: draft.sessionKey,
+          providerMessageId: null,
+          deliveredAt: draft.createdAt
+        }))
+      };
+      const interruptTurn = vi.fn(async () => {
+        deferred.reject(new DesktopDriverError("Codex turn interrupted", "turn_cancelled"));
+        return true;
+      });
+      const orchestrator = new BridgeOrchestrator({
+        transcriptStore,
+        sessionStore,
+        turnStore,
+        conversationProvider,
+        qqEgress,
+        turnHeartbeatIntervalMs: 0,
+        turnTimeoutMs: 50,
+        interruptTurn
+      });
+
+      const running = orchestrator.handleInbound(message);
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(running).resolves.toBeUndefined();
+      const bridgeTurnId = vi.mocked(turnStore.createTurn).mock.calls[0]?.[0].turnId;
+      expect(
+        vi.mocked(turnStore.updateDeadline).mock.calls.some(
+          ([calledTurnId, deadlineAt]) => calledTurnId === bridgeTurnId && deadlineAt !== null
+        )
+      ).toBe(true);
+      expect(turnStore.updateStatus).toHaveBeenCalledWith(
+        bridgeTurnId,
+        BridgeTurnStatus.TimedOut,
+        "Bridge turn exceeded hard timeout after 50ms"
+      );
+      expect(interruptTurn).toHaveBeenCalledWith(message.sessionKey);
+      expect(sessionStore.updateSessionStatus).toHaveBeenCalledWith(
+        message.sessionKey,
+        BridgeSessionStatus.Active,
+        "Bridge turn exceeded hard timeout after 50ms"
+      );
+      expect(qqEgress.deliver).toHaveBeenCalledWith(
+        expect.objectContaining({
+          draftId: `task-ended:${message.messageId}`,
+          text: "任务已停止：Bridge turn exceeded hard timeout after 50ms"
+        })
+      );
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("suppresses provider callbacks after the hard turn deadline expires", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const message = createMessage();
+      const turnStore = createTurnStore();
+      const deferred = createDeferred<OutboundDraft[]>();
+      let callbacks: ConversationRunOptions | undefined;
+
+      const transcriptStore: TranscriptStorePort = {
+        hasInbound: vi.fn().mockResolvedValue(false),
+        recordInbound: vi.fn(),
+        recordOutbound: vi.fn(),
+        listRecentConversation: vi.fn().mockResolvedValue([])
+      };
+      const sessionStore: SessionStorePort = {
+        getSession: vi.fn().mockResolvedValue(null),
+        createSession: vi.fn(),
+        updateSessionStatus: vi.fn(),
+        updateBinding: vi.fn(),
+        updateLastCodexTurnId: vi.fn(),
+        updateSkillContextKey: vi.fn(),
+        updateConversationProvider: vi.fn(),
+        withSessionLock: vi.fn(async (_sessionKey, work) => work())
+      };
+      const conversationProvider: ConversationProviderPort = {
+        runTurn: vi.fn((_message, options) => {
+          callbacks = options;
+          return deferred.promise;
+        })
+      };
+      const qqEgress: QqEgressPort = {
+        deliver: vi.fn(async (draft: OutboundDraft) => ({
+          jobId: draft.draftId,
+          sessionKey: draft.sessionKey,
+          providerMessageId: null,
+          deliveredAt: draft.createdAt
+        }))
+      };
+      const orchestrator = new BridgeOrchestrator({
+        transcriptStore,
+        sessionStore,
+        turnStore,
+        conversationProvider,
+        qqEgress,
+        turnHeartbeatIntervalMs: 0,
+        turnTimeoutMs: 50
+      });
+
+      const running = orchestrator.handleInbound(message);
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(running).resolves.toBeUndefined();
+
+      const bridgeTurnId = vi.mocked(turnStore.createTurn).mock.calls[0]?.[0].turnId;
+      const runningStatusCallCount = vi.mocked(turnStore.updateStatus).mock.calls.filter(
+        ([calledTurnId, status]) => calledTurnId === bridgeTurnId && status === BridgeTurnStatus.Running
+      ).length;
+
+      await expect(callbacks?.onStarted?.()).rejects.toMatchObject({
+        reason: "reply_timeout"
+      });
+      await callbacks?.onThreadBound?.("codex-thread-late");
+      await callbacks?.onDraft?.({
+        draftId: "draft-late-after-timeout",
+        turnId: "codex-turn-late",
+        sessionKey: message.sessionKey,
+        text: "late reply after timeout",
+        createdAt: "2026-07-01T10:00:02.000Z"
+      });
+      deferred.resolve([]);
+      await Promise.resolve();
+
+      expect(
+        vi.mocked(turnStore.updateStatus).mock.calls.filter(
+          ([calledTurnId, status]) => calledTurnId === bridgeTurnId && status === BridgeTurnStatus.Running
+        )
+      ).toHaveLength(runningStatusCallCount);
+      expect(turnStore.updateCodexThreadRef).not.toHaveBeenCalledWith(
+        bridgeTurnId,
+        "codex-thread-late"
+      );
+      expect(qqEgress.deliver).not.toHaveBeenCalledWith(
+        expect.objectContaining({ draftId: `task-started:${message.messageId}` })
+      );
+      expect(qqEgress.deliver).not.toHaveBeenCalledWith(
+        expect.objectContaining({ draftId: "draft-late-after-timeout" })
+      );
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the hard deadline when the provider reports queued after start", async () => {
+    const message = createMessage();
+    const turnStore = createTurnStore();
+
+    const transcriptStore: TranscriptStorePort = {
+      hasInbound: vi.fn().mockResolvedValue(false),
+      recordInbound: vi.fn(),
+      recordOutbound: vi.fn(),
+      listRecentConversation: vi.fn().mockResolvedValue([])
+    };
+    const sessionStore: SessionStorePort = {
+      getSession: vi.fn().mockResolvedValue(null),
+      createSession: vi.fn(),
+      updateSessionStatus: vi.fn(),
+      updateBinding: vi.fn(),
+      updateLastCodexTurnId: vi.fn(),
+      updateSkillContextKey: vi.fn(),
+      updateConversationProvider: vi.fn(),
+      withSessionLock: vi.fn(async (_sessionKey, work) => work())
+    };
+    const conversationProvider: ConversationProviderPort = {
+      runTurn: vi.fn(async (_message, options) => {
+        await options?.onStarted?.();
+        await options?.onQueued?.();
+        return [];
+      })
+    };
+    const qqEgress: QqEgressPort = {
+      deliver: vi.fn(async (draft: OutboundDraft) => ({
+        jobId: draft.draftId,
+        sessionKey: draft.sessionKey,
+        providerMessageId: null,
+        deliveredAt: draft.createdAt
+      }))
+    };
+    const orchestrator = new BridgeOrchestrator({
+      transcriptStore,
+      sessionStore,
+      turnStore,
+      conversationProvider,
+      qqEgress,
+      turnHeartbeatIntervalMs: 0,
+      turnTimeoutMs: 1000
+    });
+
+    await expect(orchestrator.handleInbound(message)).resolves.toBeUndefined();
+
+    const bridgeTurnId = vi.mocked(turnStore.createTurn).mock.calls[0]?.[0].turnId;
+    const deadlineCalls = vi.mocked(turnStore.updateDeadline).mock.calls.filter(
+      ([calledTurnId]) => calledTurnId === bridgeTurnId
+    );
+    expect(deadlineCalls.filter(([, deadlineAt]) => deadlineAt !== null)).toHaveLength(1);
+    expect(deadlineCalls.at(-1)?.[1]).not.toBeNull();
+  });
+
   it("keeps the session active when Codex reports context length exceeded", async () => {
     const message = createMessage();
     const turnStore = createTurnStore();
@@ -1170,12 +1409,27 @@ describe("BridgeOrchestrator", () => {
     };
 
     const conversationProvider: ConversationProviderPort = {
-      runTurn: vi.fn().mockRejectedValue(
-        new DesktopDriverError(
+      runTurn: vi.fn(async () => {
+        vi.mocked(turnStore.getTurn).mockImplementation(async (turnId) => ({
+          turnId,
+          sessionKey: message.sessionKey,
+          codexThreadRef: null,
+          codexTurnRef: "codex-turn-failed",
+          qqMessageId: message.messageId,
+          status: BridgeTurnStatus.Failed,
+          startedAt: message.receivedAt,
+          updatedAt: message.receivedAt,
+          deadlineAt: null,
+          lastEventAt: message.receivedAt,
+          lastToolName: null,
+          lastError: "context_length_exceeded",
+          deliveredTextLength: 0
+        }));
+        throw new DesktopDriverError(
           "Codex app-server turn failed: context_length_exceeded",
           "context_length_exceeded"
-        )
-      )
+        );
+      })
     };
 
     const qqEgress: QqEgressPort = {
@@ -1346,24 +1600,10 @@ describe("BridgeOrchestrator", () => {
     warnSpy.mockRestore();
   });
 
-  it("suppresses later drafts when a task was cancelled cooperatively", async () => {
+  it("suppresses a draft when the atomic streaming transition observes a terminal task", async () => {
     const message = createMessage();
     const turnStore = createTurnStore();
-    vi.mocked(turnStore.getTurn).mockResolvedValue({
-      turnId: "bridge-turn-cancelled",
-      sessionKey: message.sessionKey,
-      codexThreadRef: "thread-1",
-      codexTurnRef: null,
-      qqMessageId: message.messageId,
-      status: BridgeTurnStatus.Cancelled,
-      startedAt: "2026-07-01T10:00:00.000Z",
-      updatedAt: "2026-07-01T10:00:01.000Z",
-      deadlineAt: null,
-      lastEventAt: null,
-      lastToolName: null,
-      lastError: null,
-      deliveredTextLength: 0
-    });
+    vi.mocked(turnStore.markStreamingIfActive!).mockResolvedValue(false);
 
     const transcriptStore: TranscriptStorePort = {
       hasInbound: vi.fn().mockResolvedValue(false),
@@ -1415,13 +1655,14 @@ describe("BridgeOrchestrator", () => {
 
     await orchestrator.handleInbound(message);
 
+    expect(conversationProvider.runTurn).toHaveBeenCalled();
+    expect(turnStore.markStreamingIfActive).toHaveBeenCalledWith(
+      expect.any(String),
+      "codex-turn-1",
+      "2026-07-01T10:00:02.000Z"
+    );
     expect(transcriptStore.recordOutbound).not.toHaveBeenCalled();
     expect(qqEgress.deliver).not.toHaveBeenCalled();
-    expect(turnStore.updateStatus).not.toHaveBeenCalledWith(
-      expect.any(String),
-      BridgeTurnStatus.Completed,
-      expect.anything()
-    );
   });
 
   it("suppresses completed turn events that arrive after cancellation", async () => {

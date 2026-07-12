@@ -178,6 +178,65 @@ describe("sqlite store", () => {
     ]);
   });
 
+  it("does not restart a turn after it becomes terminal", async () => {
+    const db = createTempDb();
+    const turnStore = new SqliteTurnStore(db);
+    const sessionKey = "qqbot:default::qq:c2c:atomic-start";
+    const turnId = "bridge-turn-atomic-start";
+
+    await turnStore.createTurn({
+      turnId,
+      sessionKey,
+      codexThreadRef: null,
+      qqMessageId: "msg-atomic-start",
+      status: BridgeTurnStatus.Queued,
+      startedAt: "2026-07-01T10:00:00.000Z"
+    });
+    await expect(
+      turnStore.markRunningIfActive(turnId, "2026-07-01T10:30:00.000Z")
+    ).resolves.toBe(true);
+    await expect(turnStore.getTurn(turnId)).resolves.toMatchObject({
+      status: BridgeTurnStatus.Running,
+      deadlineAt: "2026-07-01T10:30:00.000Z"
+    });
+    await expect(
+      turnStore.markRunningIfActive(turnId, "2026-07-01T10:45:00.000Z", true)
+    ).resolves.toBe(true);
+    await expect(turnStore.getTurn(turnId)).resolves.toMatchObject({
+      status: BridgeTurnStatus.Running,
+      deadlineAt: "2026-07-01T10:30:00.000Z"
+    });
+
+    await expect(
+      turnStore.markTerminalIfActive(turnId, BridgeTurnStatus.Cancelled)
+    ).resolves.toBe(true);
+    await expect(turnStore.markQueuedIfActive(turnId)).resolves.toBe(false);
+    await expect(
+      turnStore.markRunningIfActive(turnId, "2026-07-01T11:00:00.000Z")
+    ).resolves.toBe(false);
+    await expect(
+      turnStore.markStreamingIfActive(
+        turnId,
+        "codex-turn-late",
+        "2026-07-01T11:00:05.000Z"
+      )
+    ).resolves.toBe(false);
+    await expect(
+      turnStore.markTerminalIfActive(
+        turnId,
+        BridgeTurnStatus.Completed,
+        "late completion"
+      )
+    ).resolves.toBe(false);
+    await expect(turnStore.getTurn(turnId)).resolves.toMatchObject({
+      status: BridgeTurnStatus.Cancelled,
+      deadlineAt: "2026-07-01T10:30:00.000Z",
+      codexTurnRef: null,
+      lastEventAt: null,
+      lastError: null
+    });
+  });
+
   it("does not let late turn events overwrite terminal tasks", async () => {
     const db = createTempDb();
     const turnStore = new SqliteTurnStore(db);

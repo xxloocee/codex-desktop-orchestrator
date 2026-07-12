@@ -893,6 +893,73 @@ describe("codex app-server driver", () => {
     expect(interrupts).toHaveLength(1);
   });
 
+  it("cancels an app-server turn while it is still being submitted", async () => {
+    const socket = new FakeAppServerSocket();
+    const turnStartRequest = createDeferred<Record<string, unknown>>();
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("turn/start", (message) => {
+      turnStartRequest.resolve(message);
+    });
+    socket.onRequest("turn/interrupt", (message) => {
+      socket.respond(message.id, {});
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+    const binding = {
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    };
+
+    const submission = driver.sendUserMessage(binding, {
+      messageId: "msg-1",
+      accountKey: "qqbot:default",
+      sessionKey: binding.sessionKey,
+      peerKey: "qq:c2c:user-1",
+      chatType: "c2c",
+      senderId: "user-1",
+      text: "hello",
+      receivedAt: "2026-04-21T14:30:00.000Z"
+    });
+    const request = await turnStartRequest.promise;
+
+    await expect(driver.interruptActiveTurn(binding.sessionKey)).resolves.toBe(true);
+    socket.respond(request.id, {
+      turn: {
+        id: "turn-target"
+      }
+    });
+
+    await expect(submission).rejects.toMatchObject({ reason: "turn_cancelled" });
+    await expect(driver.interruptActiveTurn(binding.sessionKey)).resolves.toBe(false);
+    const interrupts = socket.sent.filter((message) =>
+      (message as { method?: string }).method === "turn/interrupt"
+    );
+    expect(interrupts).toHaveLength(1);
+  });
+
   it("emits app-server turn events while collecting assistant reply", async () => {
     const socket = new FakeAppServerSocket();
     socket.onRequest("initialize", (message) => {

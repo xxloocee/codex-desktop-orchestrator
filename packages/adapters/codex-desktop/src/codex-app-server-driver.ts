@@ -163,6 +163,10 @@ type PendingTurn = {
   promise: Promise<AppServerTurnResult>;
 };
 
+type PendingSubmission = {
+  cancelled: boolean;
+};
+
 type ToolItemState = {
   id: string;
   type: string | null;
@@ -228,6 +232,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
   >();
   private readonly pendingTurnsBySession = new Map<string, PendingTurn>();
   private readonly pendingTurnsByKey = new Map<string, PendingTurn>();
+  private readonly pendingSubmissionsBySession = new Map<string, PendingSubmission>();
   private readonly pendingCompactionsByThread = new Map<string, () => void>();
   private notificationForwardTail: Promise<void> = Promise.resolve();
   private lastNotificationForwardErrorAt = 0;
@@ -454,34 +459,60 @@ export class CodexAppServerDriver implements DesktopDriverPort {
   }
 
   async sendUserMessage(binding: DriverBinding, message: InboundMessage): Promise<void> {
-    await this.ensureConnected();
-    const threadId = await this.resolveThreadId(binding.codexThreadRef);
-    if (!threadId) {
-      throw new DesktopDriverError("Codex app-server thread binding is missing", "session_not_found");
+    const submission: PendingSubmission = { cancelled: false };
+    this.pendingSubmissionsBySession.set(binding.sessionKey, submission);
+    const assertNotCancelled = () => {
+      if (submission.cancelled) {
+        throw new DesktopDriverError(
+          "Codex app-server turn was cancelled before submit",
+          "turn_cancelled"
+        );
+      }
+    };
+
+    try {
+      await this.ensureConnected();
+      assertNotCancelled();
+      const threadId = await this.resolveThreadId(binding.codexThreadRef);
+      assertNotCancelled();
+      if (!threadId) {
+        throw new DesktopDriverError("Codex app-server thread binding is missing", "session_not_found");
+      }
+
+      await this.request("thread/resume", { threadId }).catch(() => undefined);
+      assertNotCancelled();
+      await this.interruptStaleRunningTurn(threadId);
+      assertNotCancelled();
+      await this.forwardThreadSnapshotToApp(threadId);
+      assertNotCancelled();
+
+      const response = await this.request<TurnStartResponse>("turn/start", {
+        threadId,
+        input: [
+          {
+            type: "text",
+            text: message.text,
+            text_elements: []
+          }
+        ]
+      });
+      const turnId = response.turn?.id;
+      if (!turnId) {
+        throw new DesktopDriverError("Codex app-server did not return a turn id", "submit_failed");
+      }
+      if (submission.cancelled) {
+        await this.interruptTurn(threadId, turnId).catch(() => undefined);
+        assertNotCancelled();
+      }
+
+      const pending = this.createPendingTurn(binding.sessionKey, threadId, turnId);
+      this.pendingTurnsBySession.set(binding.sessionKey, pending);
+      this.pendingTurnsByKey.set(buildTurnKey(threadId, turnId), pending);
+    } finally {
+      if (this.pendingSubmissionsBySession.get(binding.sessionKey) === submission) {
+        this.pendingSubmissionsBySession.delete(binding.sessionKey);
+      }
     }
-
-    await this.request("thread/resume", { threadId }).catch(() => undefined);
-    await this.interruptStaleRunningTurn(threadId);
-    await this.forwardThreadSnapshotToApp(threadId);
-
-    const response = await this.request<TurnStartResponse>("turn/start", {
-      threadId,
-      input: [
-        {
-          type: "text",
-          text: message.text,
-          text_elements: []
-        }
-      ]
-    });
-    const turnId = response.turn?.id;
-    if (!turnId) {
-      throw new DesktopDriverError("Codex app-server did not return a turn id", "submit_failed");
-    }
-
-    const pending = this.createPendingTurn(binding.sessionKey, threadId, turnId);
-    this.pendingTurnsBySession.set(binding.sessionKey, pending);
-    this.pendingTurnsByKey.set(buildTurnKey(threadId, turnId), pending);
   }
 
   async collectAssistantReply(
@@ -540,7 +571,12 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     await this.ensureConnected();
     const pending = this.pendingTurnsBySession.get(sessionKey);
     if (!pending) {
-      return false;
+      const submission = this.pendingSubmissionsBySession.get(sessionKey);
+      if (!submission) {
+        return false;
+      }
+      submission.cancelled = true;
+      return true;
     }
 
     await this.interruptTurn(pending.threadId, pending.turnId);

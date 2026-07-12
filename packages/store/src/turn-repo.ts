@@ -70,6 +70,104 @@ export class SqliteTurnStore implements TurnStorePort {
       .run(status, lastError, updatedAt, turnId);
   }
 
+  async markRunningIfActive(
+    turnId: string,
+    deadlineAt: string | null,
+    preserveDeadline = false
+  ): Promise<boolean> {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE bridge_turns
+         SET status = ?,
+             deadline_at = CASE WHEN ? = 1 THEN deadline_at ELSE ? END,
+             updated_at = ?
+         WHERE turn_id = ?
+           AND status IN (?, ?, ?, ?)`
+      )
+      .run(
+        BridgeTurnStatus.Running,
+        preserveDeadline ? 1 : 0,
+        deadlineAt,
+        now,
+        turnId,
+        ...ACTIVE_BRIDGE_TURN_STATUSES
+      );
+    return result.changes > 0;
+  }
+
+  async markQueuedIfActive(turnId: string, preserveDeadline = false): Promise<boolean> {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE bridge_turns
+         SET status = ?,
+             deadline_at = CASE WHEN ? = 1 THEN deadline_at ELSE NULL END,
+             updated_at = ?
+         WHERE turn_id = ?
+           AND status IN (?, ?, ?, ?)`
+      )
+      .run(
+        BridgeTurnStatus.Queued,
+        preserveDeadline ? 1 : 0,
+        now,
+        turnId,
+        ...ACTIVE_BRIDGE_TURN_STATUSES
+      );
+    return result.changes > 0;
+  }
+
+  async markStreamingIfActive(
+    turnId: string,
+    codexTurnRef: string,
+    eventAt: string
+  ): Promise<boolean> {
+    const result = this.db
+      .prepare(
+        `UPDATE bridge_turns
+         SET status = ?,
+             codex_turn_ref = COALESCE(codex_turn_ref, ?),
+             last_event_at = ?,
+             updated_at = ?
+         WHERE turn_id = ?
+           AND status IN (?, ?, ?, ?)`
+      )
+      .run(
+        BridgeTurnStatus.Streaming,
+        codexTurnRef,
+        eventAt,
+        eventAt,
+        turnId,
+        ...ACTIVE_BRIDGE_TURN_STATUSES
+      );
+    return result.changes > 0;
+  }
+
+  async markTerminalIfActive(
+    turnId: string,
+    status: BridgeTurnStatus,
+    lastError: string | null = null
+  ): Promise<boolean> {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE bridge_turns
+         SET status = ?,
+             last_error = ?,
+             updated_at = ?
+         WHERE turn_id = ?
+           AND status IN (?, ?, ?, ?)`
+      )
+      .run(
+        status,
+        lastError,
+        now,
+        turnId,
+        ...ACTIVE_BRIDGE_TURN_STATUSES
+      );
+    return result.changes > 0;
+  }
+
   async updateDeadline(turnId: string, deadlineAt: string | null): Promise<void> {
     const now = new Date().toISOString();
     this.db

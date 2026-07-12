@@ -346,6 +346,29 @@ describe("codex desktop driver contract", () => {
     );
   });
 
+  it("interrupts the active DOM turn through the composer stop control", async () => {
+    const evaluateOnPage = vi.fn().mockResolvedValue({ interrupted: true });
+    const driver = new CodexDesktopDriver({
+      listTargets: vi.fn().mockResolvedValue([
+        {
+          id: "page-1",
+          title: "Codex",
+          type: "page",
+          url: "app://codex"
+        }
+      ]),
+      evaluateOnPage
+    } as unknown as CdpSession);
+
+    await expect(
+      driver.interruptActiveTurn("qqbot:default::qq:c2c:OPENID123")
+    ).resolves.toBe(true);
+    expect(evaluateOnPage).toHaveBeenCalledWith(
+      expect.stringContaining("stopMatcher"),
+      "page-1"
+    );
+  });
+
   it("binds a session to the first inspectable page target", async () => {
     const driver = new CodexDesktopDriver({
       connect: vi.fn().mockResolvedValue({

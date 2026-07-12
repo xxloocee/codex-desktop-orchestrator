@@ -40,6 +40,22 @@ export interface TurnStorePort {
     lastError?: string | null,
     updatedAt?: string
   ): Promise<void>;
+  markRunningIfActive?(
+    turnId: string,
+    deadlineAt: string | null,
+    preserveDeadline?: boolean
+  ): Promise<boolean>;
+  markQueuedIfActive?(turnId: string, preserveDeadline?: boolean): Promise<boolean>;
+  markStreamingIfActive?(
+    turnId: string,
+    codexTurnRef: string,
+    eventAt: string
+  ): Promise<boolean>;
+  markTerminalIfActive?(
+    turnId: string,
+    status: BridgeTurnStatus,
+    lastError?: string | null
+  ): Promise<boolean>;
   updateDeadline(turnId: string, deadlineAt: string | null): Promise<void>;
   recordTurnEvent(input: {
     sessionKey: string;

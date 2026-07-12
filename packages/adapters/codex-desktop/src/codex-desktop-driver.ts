@@ -95,6 +95,7 @@ export class CodexDesktopDriver implements DesktopDriverPort {
   private readonly localSubmissionReader: CodexDesktopDriverOptions["localSubmissionReader"];
   private readonly pendingReplyBaselines = new Map<string, AssistantReplySnapshot>();
   private readonly pendingLocalRolloutCursors = new Map<string, CodexLocalRolloutCursor>();
+  private readonly activeTargetIdsBySession = new Map<string, string>();
 
   constructor(
     private readonly cdp: CdpSession,
@@ -127,6 +128,16 @@ export class CodexDesktopDriver implements DesktopDriverPort {
         "app_not_ready"
       );
     }
+  }
+
+  async interruptActiveTurn(sessionKey: string): Promise<boolean> {
+    const targetId = this.activeTargetIdsBySession.get(sessionKey)
+      ?? (await this.resolvePageTarget()).id;
+    const result = (await this.cdp.evaluateOnPage(
+      this.buildInterruptActiveTurnScript(),
+      targetId
+    )) as { interrupted?: boolean } | undefined;
+    return result?.interrupted === true;
   }
 
   async getControlState(): Promise<CodexControlState> {
@@ -303,6 +314,7 @@ export class CodexDesktopDriver implements DesktopDriverPort {
 
   async sendUserMessage(binding: DriverBinding, message: InboundMessage): Promise<void> {
     const targetId = await this.ensureThreadSelected(binding);
+    this.activeTargetIdsBySession.set(binding.sessionKey, targetId);
     const baselineReply = await this.readLatestAssistantSnapshot(targetId);
     this.pendingReplyBaselines.set(binding.sessionKey, baselineReply);
     await this.capturePendingLocalRolloutCursor(binding);
@@ -314,6 +326,7 @@ export class CodexDesktopDriver implements DesktopDriverPort {
     )) as { ok?: boolean; reason?: string } | undefined;
 
     if (!focusResult?.ok) {
+      this.activeTargetIdsBySession.delete(binding.sessionKey);
       this.pendingReplyBaselines.delete(binding.sessionKey);
       this.pendingLocalRolloutCursors.delete(binding.sessionKey);
       throw new DesktopDriverError(
@@ -412,6 +425,7 @@ export class CodexDesktopDriver implements DesktopDriverPort {
 
     this.pendingReplyBaselines.delete(binding.sessionKey);
     this.pendingLocalRolloutCursors.delete(binding.sessionKey);
+    this.activeTargetIdsBySession.delete(binding.sessionKey);
     console.error("[codex-desktop-orchestrator] codex composer submit failed", {
       sessionKey: binding.sessionKey,
       messageId: message.messageId,
@@ -473,6 +487,17 @@ export class CodexDesktopDriver implements DesktopDriverPort {
   async collectAssistantReply(
     binding: DriverBinding,
     options: ConversationRunOptions = {}
+  ): Promise<OutboundDraft[]> {
+    try {
+      return await this.collectAssistantReplyInternal(binding, options);
+    } finally {
+      this.activeTargetIdsBySession.delete(binding.sessionKey);
+    }
+  }
+
+  private async collectAssistantReplyInternal(
+    binding: DriverBinding,
+    options: ConversationRunOptions
   ): Promise<OutboundDraft[]> {
     const localCursor =
       this.pendingLocalRolloutCursors.get(binding.sessionKey)
@@ -1537,6 +1562,59 @@ export class CodexDesktopDriver implements DesktopDriverPort {
       input.focus();
       return { ok: true, reason: 'focused_input' };
     })();`;
+  }
+
+  private buildInterruptActiveTurnScript(): string {
+    return `(() => {
+      const composer = document.querySelector(
+        '[data-codex-composer="true"], textarea, input[type="text"], [contenteditable="true"], [role="textbox"]'
+      );
+      const composerRect = composer instanceof HTMLElement
+        ? composer.getBoundingClientRect()
+        : null;
+      const stopMatcher = /(\\bstop\\b|\\bcancel\\b|停止|中止|取消)/i;
+      const controls = Array.from(
+        document.querySelectorAll('button, [role="button"], [aria-label]')
+      );
+      const stopButton = controls.find((node) => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const rect = node.getBoundingClientRect();
+        const nearComposer = composerRect
+          ? rect.y >= composerRect.y - 48 && rect.y <= composerRect.bottom + 48
+          : rect.y >= window.innerHeight - 160;
+        if (!nearComposer) {
+          return false;
+        }
+        const label = [
+          node.textContent || '',
+          node.getAttribute('aria-label') || '',
+          node.getAttribute('title') || ''
+        ].join(' ').trim();
+        if (stopMatcher.test(label)) {
+          return true;
+        }
+        const className = String(node.className || '');
+        const html = node.innerHTML || '';
+        return className.includes('size-token-button-composer')
+          && (html.includes('M4.5 5.75C4.5 5.05964') || html.includes('M4.5 5.75C4.5 5.0596'));
+      });
+      if (!(stopButton instanceof HTMLElement)) {
+        return { interrupted: false };
+      }
+      stopButton.focus();
+      if (typeof stopButton.click === 'function') {
+        stopButton.click();
+      } else {
+        stopButton.dispatchEvent(new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          view: window
+        }));
+      }
+      return { interrupted: true };
+    })()`;
   }
 
   private buildSubmitComposerScript(): string {

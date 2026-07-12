@@ -53,6 +53,21 @@ describe("bridge config", () => {
     );
   });
 
+  it("loads turn timeout default and env override", () => {
+    const defaultConfig = loadConfigFromEnv({
+      QQBOT_APP_ID: "qq-app",
+      QQBOT_CLIENT_SECRET: "qq-secret"
+    });
+    const overrideConfig = loadConfigFromEnv({
+      QQBOT_APP_ID: "qq-app",
+      QQBOT_CLIENT_SECRET: "qq-secret",
+      QQ_CODEX_TURN_TIMEOUT_MS: "1234"
+    });
+
+    expect(defaultConfig.runtime.turnTimeoutMs).toBe(1800000);
+    expect(overrideConfig.runtime.turnTimeoutMs).toBe(1234);
+  });
+
   it("loads multiple qq and weixin accounts from structured env json", () => {
     const config = loadConfigFromEnv({
       QQBOT_APP_ID: "fallback-app",
@@ -114,7 +129,8 @@ describe("bridge config", () => {
         runtime: {
           listenHost: "127.0.0.1",
           listenPort: 3100,
-          webhookPath: "/webhooks/qq"
+          webhookPath: "/webhooks/qq",
+          turnTimeoutMs: 2500
         },
         qqBot: {
           accountId: "main",
@@ -138,11 +154,13 @@ describe("bridge config", () => {
 
     const config = loadConfig({
       QQ_CODEX_RUNTIME_HOME: runtimeHome,
-      QQ_CODEX_LISTEN_PORT: "3999"
+      QQ_CODEX_LISTEN_PORT: "3999",
+      QQ_CODEX_TURN_TIMEOUT_MS: "7777"
     });
 
     expect(config.databasePath).toBe("runtime/from-config.sqlite");
     expect(config.runtime.listenPort).toBe(3999);
+    expect(config.runtime.turnTimeoutMs).toBe(7777);
     expect(config.qqBots).toEqual([
       expect.objectContaining({
         accountId: "main",
