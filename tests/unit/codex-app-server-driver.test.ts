@@ -56,6 +56,23 @@ function createDeferred<T>() {
 }
 
 describe("codex app-server driver", () => {
+  it("enables a five-minute tool silence timeout by default", () => {
+    const previous = process.env.CODEX_TOOL_SILENCE_TIMEOUT_MS;
+    delete process.env.CODEX_TOOL_SILENCE_TIMEOUT_MS;
+    try {
+      const driver = new CodexAppServerDriver();
+      expect(
+        (driver as unknown as { toolSilenceTimeoutMs: number }).toolSilenceTimeoutMs
+      ).toBe(300_000);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.CODEX_TOOL_SILENCE_TIMEOUT_MS;
+      } else {
+        process.env.CODEX_TOOL_SILENCE_TIMEOUT_MS = previous;
+      }
+    }
+  });
+
   it("reports a managed app-server spawn failure without crashing the process", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     class FailingSocket extends EventEmitter {

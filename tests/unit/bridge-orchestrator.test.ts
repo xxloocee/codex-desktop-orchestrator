@@ -331,8 +331,26 @@ describe("BridgeOrchestrator", () => {
 
   it("sends heartbeat drafts while a turn is still running", async () => {
     vi.useFakeTimers();
-    const message = createMessage();
+    const message = createMessage({
+      messageId: "retry:internal-1",
+      replyToMessageId: "msg-retry-command-1"
+    });
     const turnStore = createTurnStore();
+    vi.mocked(turnStore.getTurn).mockResolvedValue({
+      turnId: "bridge-turn-1",
+      sessionKey: message.sessionKey,
+      codexThreadRef: "thread-1",
+      codexTurnRef: "codex-turn-1",
+      qqMessageId: message.messageId,
+      status: BridgeTurnStatus.ToolRunning,
+      startedAt: message.receivedAt,
+      updatedAt: message.receivedAt,
+      deadlineAt: null,
+      lastEventAt: message.receivedAt,
+      lastToolName: "pnpm test",
+      lastError: null,
+      deliveredTextLength: 0
+    });
     const deferred = createDeferred<OutboundDraft[]>();
 
     const transcriptStore: TranscriptStorePort = {
@@ -384,7 +402,12 @@ describe("BridgeOrchestrator", () => {
     deferred.resolve([]);
     await running;
 
-    expect(delivered.map((draft) => draft.text)).toContain("任务仍在运行。");
+    expect(delivered.map((draft) => draft.text)).toContain("任务仍在运行：pnpm test");
+    expect(delivered).toContainEqual(
+      expect.objectContaining({
+        replyToMessageId: "msg-retry-command-1"
+      })
+    );
     vi.useRealTimers();
   });
 
@@ -746,6 +769,56 @@ describe("BridgeOrchestrator", () => {
       })
     );
     warnSpy.mockRestore();
+  });
+
+  it("does not suppress an explicit retry of a recently received message", async () => {
+    const firstMessage = createMessage({
+      messageId: "msg-original",
+      text: "same task",
+      receivedAt: "2026-04-10T21:58:49.000Z"
+    });
+    const retryMessage = createMessage({
+      messageId: "retry:internal-1",
+      replyToMessageId: "msg-retry-command",
+      retryOfTurnId: "bridge-turn-failed-1",
+      text: "same task",
+      receivedAt: "2026-04-10T21:59:10.000Z"
+    });
+    const transcriptStore: TranscriptStorePort = {
+      hasInbound: vi.fn().mockResolvedValue(false),
+      recordInbound: vi.fn(),
+      recordOutbound: vi.fn(),
+      listRecentConversation: vi.fn().mockResolvedValue([])
+    };
+    const sessionStore: SessionStorePort = {
+      getSession: vi.fn().mockResolvedValue(null),
+      createSession: vi.fn(),
+      updateSessionStatus: vi.fn(),
+      updateBinding: vi.fn(),
+      updateLastCodexTurnId: vi.fn(),
+      updateSkillContextKey: vi.fn(),
+      updateConversationProvider: vi.fn(),
+      withSessionLock: vi.fn(async (_sessionKey, work) => work())
+    };
+    const conversationProvider: ConversationProviderPort = {
+      runTurn: vi.fn().mockResolvedValue([])
+    };
+    const orchestrator = new BridgeOrchestrator({
+      transcriptStore,
+      sessionStore,
+      conversationProvider,
+      qqEgress: { deliver: vi.fn() }
+    });
+
+    await orchestrator.handleInbound(firstMessage);
+    await orchestrator.handleInbound(retryMessage);
+
+    expect(transcriptStore.recordInbound).toHaveBeenCalledTimes(2);
+    expect(conversationProvider.runTurn).toHaveBeenCalledTimes(2);
+    expect(conversationProvider.runTurn).toHaveBeenLastCalledWith(
+      retryMessage,
+      expect.objectContaining({ onDraft: expect.any(Function) })
+    );
   });
 
   it("suppresses repeated inbound messages within the window even if another message arrived in between", async () => {
@@ -2398,6 +2471,7 @@ describe("BridgeOrchestrator", () => {
           payload: {
             fullText: "前半段后半段",
             replyToMessageId: message.messageId,
+            deliveryReplyToMessageId: "msg-retry-command-2",
             completionReason: "stable"
           }
         });
@@ -2430,7 +2504,10 @@ describe("BridgeOrchestrator", () => {
     );
     expect(qqEgress.deliver).toHaveBeenNthCalledWith(
       2,
-      expect.objectContaining({ text: "后半段", replyToMessageId: message.messageId })
+      expect.objectContaining({
+        text: "后半段",
+        replyToMessageId: "msg-retry-command-2"
+      })
     );
   });
 

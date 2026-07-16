@@ -8,10 +8,7 @@ artifacts
 *.sqlite-shm
 *.sqlite-wal
 .env
-.gitnexus
 .codegraph
-.claude
-CLAUDE.md
 .playwright-mcp/
 openclaw-login-page.png
 package-lock.json

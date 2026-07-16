@@ -813,6 +813,113 @@ describe("thread command handler", () => {
     );
   });
 
+  it("queues a fresh inbound turn for /retry on a failed task", async () => {
+    const sessionStore = createSessionStore();
+    const transcriptStore = createTranscriptStore();
+    transcriptStore.getInbound = vi.fn().mockResolvedValue(
+      createPrivateMessage("修复失败任务")
+    );
+    const turnStore = createTurnStore();
+    vi.mocked(turnStore.listRecentTurns).mockResolvedValue([
+      {
+        turnId: "bridge-turn-failed-1",
+        sessionKey: "qqbot:default::qq:c2c:OPENID123",
+        codexThreadRef: "codex-app-thread:thread-1",
+        codexTurnRef: "codex-turn-1",
+        qqMessageId: "msg-1",
+        status: BridgeTurnStatus.Failed,
+        startedAt: "2026-07-01T10:00:00.000Z",
+        updatedAt: "2026-07-01T10:00:10.000Z",
+        deadlineAt: null,
+        lastEventAt: "2026-07-01T10:00:10.000Z",
+        lastToolName: "pnpm test",
+        lastError: "test failed",
+        deliveredTextLength: 0
+      }
+    ]);
+    const retryInbound = vi.fn();
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore,
+      transcriptStore,
+      turnStore,
+      desktopDriver: createDriver(),
+      qqEgress,
+      retryInbound
+    });
+
+    await expect(
+      handler.handleIfCommand(createPrivateMessage("/retry bridge-turn-failed"))
+    ).resolves.toBe(true);
+
+    expect(sessionStore.withSessionLock).not.toHaveBeenCalled();
+    expect(transcriptStore.getInbound).toHaveBeenCalledWith("msg-1");
+    expect(retryInbound).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messageId: expect.stringMatching(/^retry:/),
+        replyToMessageId: "msg-1",
+        retryOfTurnId: "bridge-turn-failed-1",
+        text: "修复失败任务",
+        sessionKey: "qqbot:default::qq:c2c:OPENID123"
+      })
+    );
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Retry queued from task")
+      })
+    );
+  });
+
+  it("still queues /retry when the acknowledgement cannot be delivered", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const transcriptStore = createTranscriptStore();
+    transcriptStore.getInbound = vi.fn().mockResolvedValue(
+      createPrivateMessage("retry this task")
+    );
+    const turnStore = createTurnStore();
+    vi.mocked(turnStore.listRecentTurns).mockResolvedValue([
+      {
+        turnId: "bridge-turn-failed-2",
+        sessionKey: "qqbot:default::qq:c2c:OPENID123",
+        codexThreadRef: "codex-app-thread:thread-1",
+        codexTurnRef: "codex-turn-2",
+        qqMessageId: "msg-1",
+        status: BridgeTurnStatus.Failed,
+        startedAt: "2026-07-01T10:00:00.000Z",
+        updatedAt: "2026-07-01T10:00:10.000Z",
+        deadlineAt: null,
+        lastEventAt: null,
+        lastToolName: null,
+        lastError: "failed",
+        deliveredTextLength: 0
+      }
+    ]);
+    const retryInbound = vi.fn();
+    const handler = new ThreadCommandHandler({
+      sessionStore: createSessionStore(),
+      transcriptStore,
+      turnStore,
+      desktopDriver: createDriver(),
+      qqEgress: {
+        deliver: vi.fn().mockRejectedValue(new Error("qq unavailable"))
+      },
+      retryInbound
+    });
+
+    await expect(
+      handler.handleIfCommand(createPrivateMessage("/retry bridge-turn-failed-2"))
+    ).resolves.toBe(true);
+
+    expect(retryInbound).toHaveBeenCalledOnce();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "[codex-desktop-orchestrator] retry acknowledgement delivery failed",
+      expect.objectContaining({
+        sourceTurnId: "bridge-turn-failed-2",
+        error: "qq unavailable"
+      })
+    );
+  });
+
   it.each(["/cancel", "停止任务", "取消任务", "停止当前任务", "取消当前任务"])(
     "cancels the active task without waiting for the session lock: %s",
     async (command) => {

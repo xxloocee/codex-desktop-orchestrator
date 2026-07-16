@@ -2,6 +2,7 @@ export type ThreadCommandRoute =
   | { kind: "not-command" }
   | { kind: "unknown"; text: string }
   | { kind: "cancel"; taskId: string | null }
+  | { kind: "retry"; taskId: string }
   | { kind: "task-query"; query: "current" | "recent" }
   | { kind: "delivery-query" }
   | { kind: "threads" }
@@ -55,6 +56,11 @@ export function isDeliveryQueryCommand(text: string): boolean {
 export function routeThreadCommand(text: string): ThreadCommandRoute {
   if (isCancelCommand(text)) {
     return { kind: "cancel", taskId: getCancelCommandTaskId(text) };
+  }
+
+  const retryTaskId = matchRetryCommand(text);
+  if (retryTaskId) {
+    return { kind: "retry", taskId: retryTaskId };
   }
 
   if (!text.startsWith("/")) {
@@ -151,6 +157,10 @@ export function routeThreadCommand(text: string): ThreadCommandRoute {
 export function matchSourceCommand(text: string): "codex" | "chatgpt" | null {
   const match = text.match(/^\/source\s+(codex|chatgpt)$/);
   return match ? match[1] as "codex" | "chatgpt" : null;
+}
+
+export function matchRetryCommand(text: string): string | null {
+  return stringMatch(text, /^\/retry\s+(\S+)$/);
 }
 
 export function matchChatgptUseCommand(text: string): number | null {

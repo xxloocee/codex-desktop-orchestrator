@@ -43,7 +43,13 @@ function createTurnStore(input: {
 
 describe("TurnQuery", () => {
   it("builds current task text from the active turn", async () => {
-    const turn = createTurn({ lastError: "still running" });
+    const turn = createTurn({
+      lastError: "still running",
+      lastToolName: "pnpm test",
+      lastEventAt: new Date(Date.now() - 5_000).toISOString(),
+      deadlineAt: "2026-07-07T10:30:00.000Z",
+      deliveredTextLength: 42
+    });
     const turnStore = createTurnStore({ current: turn });
 
     await expect(
@@ -52,6 +58,11 @@ describe("TurnQuery", () => {
     await expect(
       new TurnQuery({ turnStore }).buildCurrentTaskText(turn.sessionKey)
     ).resolves.toContain("Last error: still running");
+    const text = await new TurnQuery({ turnStore }).buildCurrentTaskText(turn.sessionKey);
+    expect(text).toContain("Current tool: pnpm test");
+    expect(text).toContain("Last event:");
+    expect(text).toContain("Deadline: 2026-07-07T10:30:00.000Z");
+    expect(text).toContain("Delivered text: 42 chars");
     expect(turnStore.getCurrentTurn).toHaveBeenCalledWith(turn.sessionKey);
   });
 

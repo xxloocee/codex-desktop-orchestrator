@@ -2,6 +2,26 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的整理方式，并约定使用语义化版本风格来描述发布节奏。
 
+## [Unreleased]
+
+### Added
+
+- `/retry <taskId>`：从失败、超时或 orphaned 任务的原始入站消息创建新 turn。
+- CLI `tasks`、`task <taskId>`、`deliveries` 运维查询。
+- `bridge_turn_events` 工具事件历史与 task 级查询。
+- 可续租、跨 store 不覆盖的 Codex thread lock lease。
+
+### Changed
+
+- 访问控制默认改为 `deny-by-default`，`doctor` 会提示 allow-all 或空 allowlist。
+- 工具沉默超时默认启用为 5 分钟，并支持环境变量调整。
+- 长任务心跳会显示当前工具；`/task current` 展示最后工具、事件、deadline 和投递进度。
+- README 和 Turn Manager 文档同步当前已实现能力。
+
+### Removed
+
+- 仓库内旧代码图 MCP 配置、专用约束、索引目录和辅助脚本。
+
 ## [0.0.1] - 2026-06-29
 
 ### Changed

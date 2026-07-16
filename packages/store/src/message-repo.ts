@@ -58,6 +58,18 @@ export class SqliteTranscriptStore implements TranscriptStorePort {
     return row !== undefined && row !== null;
   }
 
+  async getInbound(messageId: string): Promise<InboundMessage | null> {
+    const row = this.db
+      .prepare(
+        `SELECT payload_json AS payloadJson
+         FROM message_ledger
+         WHERE message_id = ?
+           AND direction = 'inbound'`
+      )
+      .get(messageId) as { payloadJson: string } | undefined;
+    return row ? JSON.parse(row.payloadJson) as InboundMessage : null;
+  }
+
   async listRecentConversation(sessionKey: string, limit: number): Promise<ConversationEntry[]> {
     const rows = this.db
       .prepare(

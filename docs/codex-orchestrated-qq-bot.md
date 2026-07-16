@@ -184,6 +184,7 @@ Delivery Worker 负责：
 pnpm start -- status
 pnpm start -- tasks
 pnpm start -- task <taskId>
+pnpm start -- deliveries
 pnpm start -- logs <n>
 ```
 
@@ -287,6 +288,20 @@ Draft Formatter -> Delivery Worker -> QQ Egress
 - `/cancel` 能中断当前任务并释放锁。
 - daemon 重启后，旧的 running turn 不会永久占锁。
 - delivery job 失败后会重试，最终 delivered 或 failed。
+
+## 当前实现状态
+
+截至当前版本，Phase 1-5 的主链路均已接入：
+
+- Turn 状态、session 队列、Codex thread lock 和终态迟到事件抑制。
+- request timeout、turn hard timeout、默认 5 分钟 tool silence timeout 和 driver interrupt。
+- `/tasks`、`/task current`、`/cancel [taskId]`、`/retry <taskId>`、`/new <alias> <task>`。
+- 工具事件历史、带当前工具的节流心跳，以及 CLI `tasks/task/deliveries` 查询。
+- Delivery Worker 消费、重试、失败收口和 in-flight 重启处理。
+- daemon 启动时对 active turn 和遗留锁执行 timed-out/orphaned 恢复。
+
+当前恢复语义是“可靠收口并允许重新提交”，不是恢复旧 Codex 进程现场；`/retry`
+会读取原始入站消息并创建一个全新的 turn。
 
 ## 非目标
 

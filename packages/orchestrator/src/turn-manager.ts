@@ -233,8 +233,11 @@ function buildTurnEventDraft(event: TurnEvent, text: string): OutboundDraft {
     sessionKey: event.sessionKey,
     text,
     createdAt: event.createdAt,
-    ...(event.payload.replyToMessageId
-      ? { replyToMessageId: event.payload.replyToMessageId }
+    ...(event.payload.deliveryReplyToMessageId ?? event.payload.replyToMessageId
+      ? {
+          replyToMessageId:
+            event.payload.deliveryReplyToMessageId ?? event.payload.replyToMessageId
+        }
       : {})
   };
 }

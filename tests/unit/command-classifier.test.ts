@@ -7,8 +7,9 @@ import {
   isTaskQueryCommand,
   matchChatgptUseCommand,
   matchForkThreadCommand,
-  matchNewProjectCommand,
-  matchNewThreadCommand,
+    matchNewProjectCommand,
+    matchNewThreadCommand,
+    matchRetryCommand,
   matchSourceCommand,
   matchSwitchModelCommand,
   matchUseThreadCommand,
@@ -36,6 +37,7 @@ describe("command classifier", () => {
     expect(matchSwitchModelCommand("/mu GPT-5")).toBe("GPT-5");
     expect(matchUseThreadCommand("/tu 2")).toBe(2);
     expect(matchNewThreadCommand("/tn My thread")).toBe("My thread");
+    expect(matchRetryCommand("/retry bridge-turn-1")).toBe("bridge-turn-1");
     expect(matchForkThreadCommand("/tf Forked")).toBe("Forked");
     expect(matchNewProjectCommand("/new bridge fix bug")).toEqual({
       alias: "bridge",
@@ -63,6 +65,10 @@ describe("command classifier", () => {
     expect(routeThreadCommand("取消任务 turn-1")).toEqual({
       kind: "cancel",
       taskId: "turn-1"
+    });
+    expect(routeThreadCommand("/retry turn-2")).toEqual({
+      kind: "retry",
+      taskId: "turn-2"
     });
   });
 });

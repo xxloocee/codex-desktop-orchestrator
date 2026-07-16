@@ -95,6 +95,21 @@ export function createSqliteDatabase(filePath: string): SqliteDatabase {
       locked_at TEXT NOT NULL,
       expires_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS bridge_turn_events (
+      event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      turn_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      status TEXT NOT NULL,
+      event_at TEXT NOT NULL,
+      tool_name TEXT,
+      tool_status TEXT,
+      summary TEXT,
+      error TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS bridge_turn_events_turn_id_event_at
+      ON bridge_turn_events (turn_id, event_at);
   `);
 
   ensureColumn(db, "bridge_sessions", "skill_context_key", "TEXT");

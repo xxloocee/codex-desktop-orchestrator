@@ -1,9 +1,11 @@
 import {
   ACTIVE_BRIDGE_TURN_STATUSES,
   BridgeTurnStatus,
+  type BridgeTurnEventRecord,
   type BridgeTurnRecord,
   type CreateBridgeTurn
 } from "../../domain/src/turn.js";
+import { TurnEventType, type ToolEventStatus } from "../../domain/src/message.js";
 import type { TurnStorePort } from "../../ports/src/store.js";
 import type { SqliteDatabase } from "./sqlite.js";
 
@@ -186,7 +188,10 @@ export class SqliteTurnStore implements TurnStorePort {
     qqMessageId?: string | null;
     status: BridgeTurnStatus;
     eventAt: string;
+    eventType?: TurnEventType;
     lastToolName?: string | null;
+    toolStatus?: ToolEventStatus | null;
+    summary?: string | null;
     lastError?: string | null;
   }): Promise<void> {
     this.db
@@ -230,6 +235,31 @@ export class SqliteTurnStore implements TurnStorePort {
         input.qqMessageId ?? null,
         BridgeTurnStatus.Queued
       );
+
+    const turn = await this.getTurnByCodexTurn(
+      input.sessionKey,
+      input.codexTurnRef,
+      input.qqMessageId ?? null
+    );
+    if (turn) {
+      this.db
+        .prepare(
+          `INSERT INTO bridge_turn_events (
+             turn_id, event_type, status, event_at, tool_name,
+             tool_status, summary, error
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          turn.turnId,
+          input.eventType ?? TurnEventType.Status,
+          input.status,
+          input.eventAt,
+          input.lastToolName ?? null,
+          input.toolStatus ?? null,
+          input.summary ?? null,
+          input.lastError ?? null
+        );
+    }
   }
 
   async addDeliveredText(turnId: string, textLength: number): Promise<void> {
@@ -329,6 +359,50 @@ export class SqliteTurnStore implements TurnStorePort {
       .all(sessionKey, Math.max(1, limit)) as TurnRow[];
 
     return rows;
+  }
+
+  async listRecentTurnsAll(limit: number): Promise<BridgeTurnRecord[]> {
+    return this.db
+      .prepare(
+        `SELECT ${TURN_COLUMNS}
+         FROM bridge_turns
+         ORDER BY updated_at DESC
+         LIMIT ?`
+      )
+      .all(Math.max(1, limit)) as TurnRow[];
+  }
+
+  async listTurnEvents(turnId: string, limit: number): Promise<BridgeTurnEventRecord[]> {
+    const eventTable = this.db
+      .prepare(
+        `SELECT 1 AS found
+         FROM sqlite_master
+         WHERE type = 'table' AND name = 'bridge_turn_events'
+         LIMIT 1`
+      )
+      .get() as { found?: number } | undefined;
+    if (eventTable?.found !== 1) {
+      return [];
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT event_id AS eventId,
+                turn_id AS turnId,
+                event_type AS eventType,
+                status,
+                event_at AS eventAt,
+                tool_name AS toolName,
+                tool_status AS toolStatus,
+                summary,
+                error
+         FROM bridge_turn_events
+         WHERE turn_id = ?
+         ORDER BY event_at DESC, event_id DESC
+         LIMIT ?`
+      )
+      .all(turnId, Math.max(1, limit)) as BridgeTurnEventRecord[];
+    return rows.reverse();
   }
 }
 

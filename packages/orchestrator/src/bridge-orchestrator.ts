@@ -64,6 +64,7 @@ export class BridgeOrchestrator {
   }
 
   async handleInbound(message: InboundMessage): Promise<void> {
+    const deliveryReplyToMessageId = message.replyToMessageId ?? message.messageId;
     const alreadySeen = await this.deps.transcriptStore.hasInbound(message.messageId);
     if (alreadySeen) {
       return;
@@ -204,7 +205,7 @@ export class BridgeOrchestrator {
               sessionKey: message.sessionKey,
               text,
               createdAt: new Date().toISOString(),
-              replyToMessageId: message.messageId
+              replyToMessageId: deliveryReplyToMessageId
             }, { ...options, ignoreClosed: true });
           };
           deliverFinalStatusDraft = async (text: string) => {
@@ -220,10 +221,22 @@ export class BridgeOrchestrator {
             }
             heartbeatTimer = setInterval(() => {
               heartbeatCount += 1;
-              void deliverStatusDraft(
-                `task-heartbeat:${message.messageId}:${heartbeatCount}`,
-                "任务仍在运行。"
-              );
+              void (async () => {
+                const turn = await this.deps.turnStore?.getTurn(bridgeTurnId);
+                const text = turn?.lastToolName
+                  ? `任务仍在运行：${turn.lastToolName}`
+                  : "任务仍在运行。";
+                await deliverStatusDraft(
+                  `task-heartbeat:${message.messageId}:${heartbeatCount}`,
+                  text
+                );
+              })().catch((error) => {
+                console.warn("[codex-desktop-orchestrator] task heartbeat failed", {
+                  messageId: message.messageId,
+                  sessionKey: message.sessionKey,
+                  error: error instanceof Error ? error.message : String(error)
+                });
+              });
             }, this.turnHeartbeatIntervalMs);
           };
           stopTurnHeartbeat = () => {
@@ -243,7 +256,7 @@ export class BridgeOrchestrator {
               sessionKey: message.sessionKey,
               text: "任务已开始。",
               createdAt: new Date().toISOString(),
-              replyToMessageId: message.messageId
+              replyToMessageId: deliveryReplyToMessageId
             });
           };
 
@@ -384,7 +397,10 @@ export class BridgeOrchestrator {
         qqMessageId: event.payload.replyToMessageId ?? null,
         status: eventReduction.status,
         eventAt: event.createdAt,
+        eventType: event.eventType,
         lastToolName: event.payload.toolName ?? null,
+        toolStatus: event.payload.toolStatus ?? null,
+        summary: event.payload.summary ?? null,
         lastError: eventReduction.lastError
       });
 
@@ -421,6 +437,10 @@ export class BridgeOrchestrator {
   }
 
   private isLikelyDuplicateInbound(message: InboundMessage): boolean {
+    if (message.retryOfTurnId) {
+      return false;
+    }
+
     const receivedAtMs = Date.parse(message.receivedAt);
     if (!Number.isFinite(receivedAtMs)) {
       return false;
@@ -441,6 +461,10 @@ export class BridgeOrchestrator {
   }
 
   private rememberInbound(message: InboundMessage): void {
+    if (message.retryOfTurnId) {
+      return;
+    }
+
     const receivedAtMs = Date.parse(message.receivedAt);
     if (!Number.isFinite(receivedAtMs)) {
       return;

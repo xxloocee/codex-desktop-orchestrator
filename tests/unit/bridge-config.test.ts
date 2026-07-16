@@ -31,7 +31,7 @@ describe("bridge config", () => {
     ]);
     expect(config.accessControl).toEqual(
       expect.objectContaining({
-        mode: "allow-all",
+        mode: "deny-by-default",
         allowedC2cSenderIds: [],
         requireMentionInGroup: true
       })

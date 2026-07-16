@@ -163,6 +163,18 @@ export class SqliteDeliveryJobStore implements DeliveryJobStorePort {
 
     return rows.map(mapDeliveryJobRow);
   }
+
+  async listRecentJobsAll(limit: number): Promise<DeliveryJobRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT ${DELIVERY_JOB_COLUMNS}
+         FROM delivery_jobs
+         ORDER BY updated_at DESC
+         LIMIT ?`
+      )
+      .all(Math.max(1, limit)) as DeliveryJobRow[];
+    return rows.map(mapDeliveryJobRow);
+  }
 }
 
 const DELIVERY_JOB_COLUMNS = `

@@ -60,6 +60,10 @@ export function formatTurnSummary(turn: BridgeTurnRecord): string {
     `Message: ${turn.qqMessageId}`,
     ...(turn.codexTurnRef ? [`Codex turn: ${turn.codexTurnRef}`] : []),
     ...(turn.codexThreadRef ? [`Thread: ${turn.codexThreadRef}`] : []),
+    ...(turn.lastToolName ? [`Current tool: ${turn.lastToolName}`] : []),
+    ...(turn.lastEventAt ? [`Last event: ${formatRelativeTimestamp(turn.lastEventAt)}`] : []),
+    ...(turn.deadlineAt ? [`Deadline: ${turn.deadlineAt}`] : []),
+    `Delivered text: ${turn.deliveredTextLength} chars`,
     `Started: ${formatRelativeTimestamp(turn.startedAt)}`,
     `Updated: ${formatRelativeTimestamp(turn.updatedAt)}`
   ].join("\n");

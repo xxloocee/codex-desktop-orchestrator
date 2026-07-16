@@ -226,6 +226,7 @@ export function bootstrap() {
                 }
               }
             };
+            const deliveryReplyToMessageId = message.replyToMessageId ?? message.messageId;
             const runBoundTurn = async (targetBinding: DriverBinding) => {
               const activeTurn = await turnStore.getCurrentTurn(message.sessionKey);
               if (!activeTurn || activeTurn.qqMessageId !== message.messageId) {
@@ -244,7 +245,7 @@ export function bootstrap() {
                   ? async (draft) => {
                       await options.onDraft!({
                         ...draft,
-                        replyToMessageId: message.messageId
+                        replyToMessageId: deliveryReplyToMessageId
                       });
                     }
                   : undefined,
@@ -253,7 +254,8 @@ export function bootstrap() {
                     ...event,
                     payload: {
                       ...event.payload,
-                      replyToMessageId: message.messageId
+                      replyToMessageId: message.messageId,
+                      deliveryReplyToMessageId
                     }
                   });
                 }
@@ -276,7 +278,7 @@ export function bootstrap() {
             }
             return drafts.map((draft) => ({
               ...draft,
-              replyToMessageId: message.messageId
+              replyToMessageId: deliveryReplyToMessageId
             }));
           },
           {

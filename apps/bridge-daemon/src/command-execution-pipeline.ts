@@ -11,7 +11,7 @@ import {
 
 export type ImmediateThreadCommandRoute = Extract<
   ThreadCommandRoute,
-  { kind: "cancel" | "task-query" | "delivery-query" }
+  { kind: "cancel" | "retry" | "task-query" | "delivery-query" }
 >;
 
 export type UnknownThreadCommandRoute = Extract<ThreadCommandRoute, { kind: "unknown" }>;
@@ -89,6 +89,7 @@ export class CommandExecutionPipeline {
 
   private isImmediateRoute(route: ThreadCommandRoute): route is ImmediateThreadCommandRoute {
     return route.kind === "cancel"
+      || route.kind === "retry"
       || route.kind === "task-query"
       || route.kind === "delivery-query";
   }

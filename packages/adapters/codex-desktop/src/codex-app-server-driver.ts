@@ -167,6 +167,8 @@ type PendingSubmission = {
   cancelled: boolean;
 };
 
+const DEFAULT_TOOL_SILENCE_TIMEOUT_MS = 5 * 60_000;
+
 type ToolItemState = {
   id: string;
   type: string | null;
@@ -252,7 +254,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
     this.toolSilenceTimeoutMs =
       options.toolSilenceTimeoutMs
       ?? parseOptionalPositiveInteger(process.env.CODEX_TOOL_SILENCE_TIMEOUT_MS)
-      ?? 0;
+      ?? DEFAULT_TOOL_SILENCE_TIMEOUT_MS;
     this.sleep =
       options.sleep ??
       ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));

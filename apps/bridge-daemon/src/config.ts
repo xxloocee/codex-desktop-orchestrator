@@ -268,20 +268,10 @@ function resolveProjectAliases(env: NodeJS.ProcessEnv): AppConfig["projectAliase
 }
 
 function loadAccessControlFromEnv(env: NodeJS.ProcessEnv): BridgeAccessControlConfig {
-  const hasAccessControlEnv = Boolean(
-    env.QQ_CODEX_ALLOWED_ACCOUNT_KEYS
-      ?? env.QQ_CODEX_ALLOWED_C2C_SENDERS
-      ?? env.QQ_CODEX_ALLOWED_GROUPS
-      ?? env.QQ_CODEX_ALLOWED_GROUP_MEMBERS
-      ?? env.QQ_CODEX_GROUP_REQUIRE_MENTION
-      ?? env.QQ_CODEX_BOT_MENTION_PATTERNS
-  );
   return {
     mode: env.QQ_CODEX_ACCESS_CONTROL === "allow-all" || env.QQ_CODEX_ACCESS_CONTROL === "deny-by-default"
       ? env.QQ_CODEX_ACCESS_CONTROL
-      : hasAccessControlEnv
-        ? "deny-by-default"
-        : "allow-all",
+      : "deny-by-default",
     allowedAccountKeys: splitList(env.QQ_CODEX_ALLOWED_ACCOUNT_KEYS),
     allowedC2cSenderIds: splitList(env.QQ_CODEX_ALLOWED_C2C_SENDERS),
     allowedGroupIds: splitList(env.QQ_CODEX_ALLOWED_GROUPS),

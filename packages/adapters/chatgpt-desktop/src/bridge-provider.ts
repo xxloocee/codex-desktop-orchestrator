@@ -48,6 +48,7 @@ export class ChatgptDesktopProvider implements ConversationProviderPort {
     message: InboundMessage,
     options?: ConversationRunOptions
   ): Promise<OutboundDraft[]> {
+    const replyToMessageId = message.replyToMessageId ?? message.messageId;
     const imageArtifacts = (message.mediaArtifacts ?? []).filter(isImageArtifact);
     const prompt = buildPrompt(message, imageArtifacts);
     const mode = detectMode(prompt);
@@ -68,7 +69,7 @@ export class ChatgptDesktopProvider implements ConversationProviderPort {
         sessionKey: message.sessionKey,
         text: `[ChatGPT Desktop 错误] ${result.errorCode}: ${result.message}`,
         createdAt: new Date().toISOString(),
-        replyToMessageId: message.messageId
+        replyToMessageId
       };
       if (options?.onDraft) {
         await options.onDraft(errorDraft);
@@ -92,7 +93,7 @@ export class ChatgptDesktopProvider implements ConversationProviderPort {
       text: result.text,
       mediaArtifacts: mediaArtifacts.length > 0 ? mediaArtifacts : undefined,
       createdAt: new Date().toISOString(),
-      replyToMessageId: message.messageId
+      replyToMessageId
     };
 
     if (options?.onDraft) {

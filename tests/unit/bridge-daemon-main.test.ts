@@ -106,7 +106,10 @@ describe("bridge daemon main", () => {
       deliveryJobStore
     });
 
-    await expect(handler(createMessage())).resolves.toBeUndefined();
+    await expect(handler(createMessage({
+      messageId: "retry:internal-1",
+      replyToMessageId: "msg-main-1"
+    }))).resolves.toBeUndefined();
     expect(errorEgress.deliver).toHaveBeenCalledWith(
       expect.objectContaining({
         sessionKey: "qqbot:default::qq:c2c:abc-123",

@@ -19,6 +19,8 @@ export type MediaArtifact = {
 
 export type InboundMessage = {
   messageId: string;
+  replyToMessageId?: string;
+  retryOfTurnId?: string;
   accountKey: string;
   sessionKey: string;
   peerKey: string;
@@ -57,6 +59,7 @@ export type TurnEventPayload = {
   fullText?: string;
   mediaReferences?: string[];
   replyToMessageId?: string;
+  deliveryReplyToMessageId?: string;
   status?: string;
   completionReason?: "stable" | "timeout_flush";
   toolName?: string;

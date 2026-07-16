@@ -1,3 +1,5 @@
+import type { ToolEventStatus, TurnEventType } from "./message.js";
+
 export enum BridgeTurnStatus {
   Queued = "queued",
   Running = "running",
@@ -41,4 +43,16 @@ export type CreateBridgeTurn = {
   status: BridgeTurnStatus;
   startedAt: string;
   deadlineAt?: string | null;
+};
+
+export type BridgeTurnEventRecord = {
+  eventId: number;
+  turnId: string;
+  eventType: TurnEventType;
+  status: BridgeTurnStatus;
+  eventAt: string;
+  toolName: string | null;
+  toolStatus: ToolEventStatus | null;
+  summary: string | null;
+  error: string | null;
 };

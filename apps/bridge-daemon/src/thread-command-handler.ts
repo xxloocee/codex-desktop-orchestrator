@@ -15,6 +15,7 @@ import type {
 import { DeliveryQuery } from "../../../packages/orchestrator/src/delivery-query.js";
 import { TurnControl } from "../../../packages/orchestrator/src/turn-control.js";
 import { TurnQuery } from "../../../packages/orchestrator/src/turn-query.js";
+import { TurnRetry } from "../../../packages/orchestrator/src/turn-retry.js";
 import {
   buildAccountsText,
   buildHelpText,
@@ -47,6 +48,7 @@ type ThreadCommandHandlerDeps = {
   chatgptDriver?: ChatgptDesktopDriver;
   accountKeys?: string[];
   projectAliases?: AppConfig["projectAliases"];
+  retryInbound?: (message: InboundMessage) => void;
 };
 
 export class ThreadCommandHandler {
@@ -60,6 +62,7 @@ export class ThreadCommandHandler {
   private readonly sourceCommandActions: SourceCommandActions;
   private readonly turnControl: TurnControl;
   private readonly turnQuery: TurnQuery;
+  private readonly turnRetry: TurnRetry;
 
   constructor(private readonly deps: ThreadCommandHandlerDeps) {
     const chatgptCommandActions = new ChatgptCommandActions({
@@ -101,6 +104,10 @@ export class ThreadCommandHandler {
     });
     this.turnQuery = new TurnQuery({
       turnStore: deps.turnStore
+    });
+    this.turnRetry = new TurnRetry({
+      turnStore: deps.turnStore,
+      transcriptStore: deps.transcriptStore
     });
     this.commandExecutionPipeline = new CommandExecutionPipeline({
       sessionStore: deps.sessionStore,
@@ -279,6 +286,9 @@ export class ThreadCommandHandler {
       case "cancel":
         await this.handleCancelCommand(message, route.taskId);
         return;
+      case "retry":
+        await this.handleRetryCommand(message, route.taskId);
+        return;
       case "task-query":
         await this.handleTaskQueryCommand(message, route.query);
         return;
@@ -336,6 +346,56 @@ export class ThreadCommandHandler {
       message,
       await this.deliveryQuery.buildDeliveryJobsText(message.sessionKey)
     );
+  }
+
+  private async handleRetryCommand(message: InboundMessage, taskId: string): Promise<void> {
+    if (!this.deps.retryInbound) {
+      await this.deliverControlReply(message, "Task retry is not configured.");
+      return;
+    }
+
+    const result = await this.turnRetry.prepare(
+      message.sessionKey,
+      taskId,
+      message.messageId
+    );
+    if (result.status === "tracking-not-configured") {
+      await this.deliverControlReply(message, "Task retry is not configured.");
+      return;
+    }
+    if (result.status === "task-not-found") {
+      await this.deliverControlReply(message, `Task not found: ${result.requestedTaskId}`);
+      return;
+    }
+    if (result.status === "task-not-retryable") {
+      await this.deliverControlReply(
+        message,
+        `Task ${result.turnId} cannot be retried from status: ${result.turnStatus}`
+      );
+      return;
+    }
+    if (result.status === "original-message-not-found") {
+      await this.deliverControlReply(
+        message,
+        `Original inbound message is unavailable for task: ${result.turnId}`
+      );
+      return;
+    }
+
+    try {
+      await this.deliverControlReply(
+        message,
+        `Retry queued from task: ${result.sourceTurnId}`
+      );
+    } catch (error) {
+      console.warn("[codex-desktop-orchestrator] retry acknowledgement delivery failed", {
+        sourceTurnId: result.sourceTurnId,
+        messageId: message.messageId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } finally {
+      this.deps.retryInbound(result.message);
+    }
   }
 
   private async handleCancelCommand(message: InboundMessage, taskId: string | null): Promise<void> {

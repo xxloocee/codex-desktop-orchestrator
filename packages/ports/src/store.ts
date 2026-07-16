@@ -4,9 +4,16 @@ import type {
   DeliveryJobRecord,
   DeliveryJobStatus,
   InboundMessage,
-  OutboundDraft
+  OutboundDraft,
+  ToolEventStatus,
+  TurnEventType
 } from "../../domain/src/message.js";
-import type { BridgeTurnRecord, BridgeTurnStatus, CreateBridgeTurn } from "../../domain/src/turn.js";
+import type {
+  BridgeTurnEventRecord,
+  BridgeTurnRecord,
+  BridgeTurnStatus,
+  CreateBridgeTurn
+} from "../../domain/src/turn.js";
 
 export interface SessionStorePort {
   getSession(sessionKey: string): Promise<BridgeSession | null>;
@@ -27,6 +34,7 @@ export interface TranscriptStorePort {
   recordInbound(message: InboundMessage): Promise<void>;
   recordOutbound(draft: OutboundDraft): Promise<void>;
   hasInbound(messageId: string): Promise<boolean>;
+  getInbound?(messageId: string): Promise<InboundMessage | null>;
   listRecentConversation(sessionKey: string, limit: number): Promise<ConversationEntry[]>;
 }
 
@@ -63,7 +71,10 @@ export interface TurnStorePort {
     qqMessageId?: string | null;
     status: BridgeTurnStatus;
     eventAt: string;
+    eventType?: TurnEventType;
     lastToolName?: string | null;
+    toolStatus?: ToolEventStatus | null;
+    summary?: string | null;
     lastError?: string | null;
   }): Promise<void>;
   addDeliveredText(turnId: string, textLength: number): Promise<void>;
@@ -75,6 +86,7 @@ export interface TurnStorePort {
     qqMessageId?: string | null
   ): Promise<BridgeTurnRecord | null>;
   listRecentTurns(sessionKey: string, limit: number): Promise<BridgeTurnRecord[]>;
+  listTurnEvents?(turnId: string, limit: number): Promise<BridgeTurnEventRecord[]>;
 }
 
 export interface ThreadLockStorePort {

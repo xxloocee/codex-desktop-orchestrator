@@ -4,6 +4,11 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCli } from "../../apps/bridge-daemon/src/cli.js";
+import { TurnEventType } from "../../packages/domain/src/message.js";
+import { BridgeTurnStatus } from "../../packages/domain/src/turn.js";
+import { SqliteTranscriptStore } from "../../packages/store/src/message-repo.js";
+import { createSqliteDatabase } from "../../packages/store/src/sqlite.js";
+import { SqliteTurnStore } from "../../packages/store/src/turn-repo.js";
 
 const require = createRequire(import.meta.url);
 const BetterSqlite3 = require("better-sqlite3") as new (filePath: string) => {
@@ -64,7 +69,7 @@ describe("cli", () => {
       projectAliases?: Record<string, { cwd?: string; label?: string }>;
     };
     const aliasName = path.basename(cwd);
-    expect(config.accessControl?.mode).toBe("allow-all");
+    expect(config.accessControl?.mode).toBe("deny-by-default");
     expect(config.projectAliases?.[aliasName]).toEqual({
       cwd: path.resolve(cwd),
       label: aliasName
@@ -320,6 +325,105 @@ describe("cli", () => {
     expect(payload.runtime?.paths?.home).toBe(runtimeHome);
   });
 
+  it("queries recent tasks, task events, and deliveries from the CLI", async () => {
+    const runtimeHome = createTempDir("qq-codex-runtime-");
+    const dbPath = path.join(runtimeHome, "bridge.sqlite");
+    const db = createSqliteDatabase(dbPath);
+    const transcriptStore = new SqliteTranscriptStore(db);
+    const turnStore = new SqliteTurnStore(db);
+    const sessionKey = "qqbot:default::qq:c2c:OPENID123";
+    await turnStore.createTurn({
+      turnId: "bridge-turn-cli-1",
+      sessionKey,
+      codexThreadRef: "codex-app-thread:thread-1",
+      qqMessageId: "msg-cli-1",
+      status: BridgeTurnStatus.Running,
+      startedAt: "2026-07-01T10:00:00.000Z"
+    });
+    await turnStore.recordTurnEvent({
+      sessionKey,
+      codexTurnRef: "codex-turn-cli-1",
+      qqMessageId: "msg-cli-1",
+      status: BridgeTurnStatus.ToolRunning,
+      eventAt: "2026-07-01T10:00:10.000Z",
+      eventType: TurnEventType.Status,
+      lastToolName: "pnpm test",
+      toolStatus: "started"
+    });
+    await transcriptStore.recordOutbound({
+      draftId: "draft-cli-1",
+      sessionKey,
+      text: "任务已开始。",
+      createdAt: "2026-07-01T10:00:11.000Z"
+    });
+    db.close();
+
+    const env = {
+      QQ_CODEX_RUNTIME_HOME: runtimeHome,
+      QQ_CODEX_DATABASE_PATH: dbPath,
+      QQBOT_APP_ID: "app-id",
+      QQBOT_CLIENT_SECRET: "secret",
+      QQ_CODEX_ALLOWED_C2C_SENDERS: "OPENID123"
+    };
+    const tasksIo = collectWrites();
+    const taskIo = collectWrites();
+    const deliveriesIo = collectWrites();
+
+    await expect(runCli(["tasks"], { env, ...tasksIo })).resolves.toBe(0);
+    await expect(
+      runCli(["task", "bridge-turn-cli-1"], { env, ...taskIo })
+    ).resolves.toBe(0);
+    await expect(runCli(["deliveries"], { env, ...deliveriesIo })).resolves.toBe(0);
+
+    expect(JSON.parse(tasksIo.stdout[0] ?? "{}")).toMatchObject({
+      status: "ok",
+      turns: [expect.objectContaining({ turnId: "bridge-turn-cli-1" })]
+    });
+    expect(JSON.parse(taskIo.stdout[0] ?? "{}")).toMatchObject({
+      status: "ok",
+      turn: expect.objectContaining({ turnId: "bridge-turn-cli-1" }),
+      events: [expect.objectContaining({ toolName: "pnpm test", toolStatus: "started" })]
+    });
+    expect(JSON.parse(deliveriesIo.stdout[0] ?? "{}")).toMatchObject({
+      status: "ok",
+      deliveries: [expect.objectContaining({ jobId: "draft-cli-1" })]
+    });
+  });
+
+  it("queries a task from a pre-event-history database", async () => {
+    const runtimeHome = createTempDir("qq-codex-runtime-");
+    const dbPath = path.join(runtimeHome, "bridge.sqlite");
+    const db = createSqliteDatabase(dbPath);
+    const turnStore = new SqliteTurnStore(db);
+    await turnStore.createTurn({
+      turnId: "bridge-turn-legacy-1",
+      sessionKey: "qqbot:default::qq:c2c:OPENID123",
+      codexThreadRef: null,
+      qqMessageId: "msg-legacy-1",
+      status: BridgeTurnStatus.Failed,
+      startedAt: "2026-07-01T10:00:00.000Z"
+    });
+    db.exec("DROP TABLE bridge_turn_events");
+    db.close();
+
+    const io = collectWrites();
+    const env = {
+      QQ_CODEX_RUNTIME_HOME: runtimeHome,
+      QQ_CODEX_DATABASE_PATH: dbPath,
+      QQBOT_APP_ID: "app-id",
+      QQBOT_CLIENT_SECRET: "secret",
+      QQ_CODEX_ALLOWED_C2C_SENDERS: "OPENID123"
+    };
+
+    await expect(
+      runCli(["task", "bridge-turn-legacy-1"], { env, ...io })
+    ).resolves.toBe(0);
+    expect(JSON.parse(io.stdout[0] ?? "{}")).toMatchObject({
+      status: "ok",
+      events: []
+    });
+  });
+
   it("ignores the pnpm argument separator", async () => {
     const runtimeHome = createTempDir("qq-codex-runtime-");
     const io = collectWrites();
@@ -491,6 +595,11 @@ describe("cli", () => {
       name: "recovery",
       status: "ok",
       message: expect.stringContaining("database not initialized")
+    }));
+    expect(payload.checks).toContainEqual(expect.objectContaining({
+      name: "accessControl",
+      status: "warning",
+      message: expect.stringContaining("allow-all")
     }));
   });
 

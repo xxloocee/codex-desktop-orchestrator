@@ -3,16 +3,13 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { ZodError } from "zod";
-import { discoverCodexInstallations } from "./codex-discovery.js";
 import { loadConfig, loadConfigFromEnv, resolveConfigPath } from "./config.js";
+import { runDoctor } from "./doctor-cli.js";
+import { runDataQueryCommand } from "./runtime-query-cli.js";
+import { guardSingleRuntimeInstance, stopRuntime } from "./runtime-control-cli.js";
 import { ensureCodexDesktopForDev, type DevLaunchConfig } from "./dev-launch.js";
-import { openReadonlySqliteDatabase } from "../../../packages/store/src/sqlite.js";
-import { SqliteRuntimeRecoveryStore } from "../../../packages/store/src/runtime-recovery-repo.js";
 import { installBridgeRuntimeSignalHandlers, runBridgeDaemon } from "./main.js";
 import {
-  clearRuntimeState,
-  ensureManagementToken,
-  ensureRuntimeHome,
   readRuntimeLogTail,
   readRuntimeStatus,
   runtimePaths
@@ -69,7 +66,17 @@ export async function runCli(rawArgs: string[], deps: CliDeps = {}): Promise<num
   }
 
   const command = args[0] ?? "start";
-  const knownCommands = new Set(["start", "status", "doctor", "logs", "stop", "restart"]);
+  const knownCommands = new Set([
+    "start",
+    "status",
+    "doctor",
+    "logs",
+    "tasks",
+    "task",
+    "deliveries",
+    "stop",
+    "restart"
+  ]);
   if (!knownCommands.has(command)) {
     writeStderr(`${LOG_PREFIX} 未知命令：${args.join(" ")}`);
     printHelp(writeStdout);
@@ -97,6 +104,14 @@ export async function runCli(rawArgs: string[], deps: CliDeps = {}): Promise<num
 
   if (command === "doctor") {
     return runDoctor({ env, writeStdout, writeStderr });
+  }
+
+  if (command === "tasks" || command === "task" || command === "deliveries") {
+    return runDataQueryCommand(command, args.slice(1), {
+      env,
+      writeStdout,
+      writeStderr
+    });
   }
 
   if (command === "stop") {
@@ -211,33 +226,6 @@ function initEnvTemplate(options: {
   return 1;
 }
 
-async function guardSingleRuntimeInstance(options: {
-  env: NodeJS.ProcessEnv;
-  writeStderr: (line: string) => void;
-}): Promise<boolean> {
-  const paths = runtimePaths(options.env);
-  const status = readRuntimeStatus(paths);
-  if (status.running && status.pid) {
-    if (await canReachRuntimeControl(paths, status.state, "/status", "GET")) {
-      options.writeStderr(
-        `${LOG_PREFIX} already running: pid=${status.pid}, runtimeHome=${paths.home}`
-      );
-      return false;
-    }
-
-    options.writeStderr(
-      `${LOG_PREFIX} clearing stale runtime state: pid=${status.pid} did not answer management checks`
-    );
-    clearRuntimeState(paths, status.pid);
-    return true;
-  }
-
-  if (status.pid) {
-    clearRuntimeState(paths, status.pid);
-  }
-  return true;
-}
-
 function printHelp(writeStdout: (line: string) => void) {
   writeStdout(CLI_NAME);
   writeStdout("");
@@ -247,6 +235,9 @@ function printHelp(writeStdout: (line: string) => void) {
   writeStdout(`  ${CLI_NAME} status          输出运行状态 JSON`);
   writeStdout(`  ${CLI_NAME} doctor          检查配置和运行目录`);
   writeStdout(`  ${CLI_NAME} logs [行数]     查看最近运行日志`);
+  writeStdout(`  ${CLI_NAME} tasks [数量]    查看最近任务`);
+  writeStdout(`  ${CLI_NAME} task <任务ID>   查看任务和工具事件`);
+  writeStdout(`  ${CLI_NAME} deliveries [数量] 查看最近投递任务`);
   writeStdout(`  ${CLI_NAME} stop            停止已记录的运行进程`);
   writeStdout(`  ${CLI_NAME} restart         停止后重新启动`);
   writeStdout(`  ${CLI_NAME} init            在当前目录生成 .env`);
@@ -298,95 +289,6 @@ function writeJsonLine(writeStdout: (line: string) => void, value: unknown): voi
   writeStdout(JSON.stringify(value));
 }
 
-function runDoctor(options: {
-  env: NodeJS.ProcessEnv;
-  writeStdout: (line: string) => void;
-  writeStderr: (line: string) => void;
-}): number {
-  const paths = runtimePaths(options.env);
-  const checks: Array<{ name: string; status: "ok" | "failed"; message: string }> = [];
-
-  try {
-    ensureRuntimeHome(paths);
-    ensureManagementToken(paths);
-    checks.push({ name: "runtimeHome", status: "ok", message: paths.home });
-  } catch (error) {
-    checks.push({
-      name: "runtimeHome",
-      status: "failed",
-      message: error instanceof Error ? error.message : String(error)
-    });
-  }
-
-  try {
-    const config = loadConfig(options.env);
-    const databasePath = path.resolve(config.databasePath);
-    if (!fs.existsSync(databasePath)) {
-      checks.push({
-        name: "recovery",
-        status: "ok",
-        message: `database not initialized: ${databasePath}`
-      });
-    } else {
-      const db = openReadonlySqliteDatabase(databasePath);
-      try {
-        const recovery = new SqliteRuntimeRecoveryStore(db).inspect();
-        const runtimeStatus = readRuntimeStatus(paths);
-        const hasUnhealthyRecoveryState =
-          recovery.expiredActiveTurns > 0
-          || (
-            !runtimeStatus.running
-            && (
-              recovery.activeTurns > 0
-              || recovery.sessionLocks.expired > 0
-              || recovery.threadLocks.expired > 0
-            )
-          );
-        checks.push({
-          name: "recovery",
-          status: hasUnhealthyRecoveryState ? "failed" : "ok",
-          message: `activeTurns=${recovery.activeTurns}, expiredActiveTurns=${recovery.expiredActiveTurns}, orphanableActiveTurns=${recovery.orphanableActiveTurns}, sessionLocks=${recovery.sessionLocks.total}/${recovery.sessionLocks.expired} expired, threadLocks=${recovery.threadLocks.total}/${recovery.threadLocks.expired} expired`
-        });
-      } finally {
-        db.close();
-      }
-    }
-    checks.push({
-      name: "config",
-      status: "ok",
-      message: `qqBots=${config.qqBots.length}, listen=${config.runtime.listenHost}:${config.runtime.listenPort}`
-    });
-  } catch (error) {
-    checks.push({
-      name: "config",
-      status: "failed",
-      message: error instanceof Error ? error.message : String(error)
-    });
-  }
-
-  const codex = discoverCodexInstallations({ env: options.env });
-  checks.push({
-    name: "codexDesktop",
-    status: codex.desktopPath ? "ok" : "failed",
-    message: codex.desktopPath
-      ? `${codex.desktopPath} (${codex.desktopSource})`
-      : "Codex Desktop was not discovered; set CODEX_APP_PATH or CODEX_DESKTOP_PATH"
-  });
-  checks.push({
-    name: "codexBinary",
-    status: codex.binaryPath ? "ok" : "failed",
-    message: `${codex.binaryPath ?? "not found"} (${codex.binarySource})`
-  });
-
-  const failed = checks.some((check) => check.status === "failed");
-  writeJsonLine(options.writeStdout, {
-    status: failed ? "failed" : "ok",
-    runtime: readRuntimeStatus(paths),
-    checks
-  });
-  return failed ? 1 : 0;
-}
-
 function defaultRuntimeConfigTemplate(cwd: string) {
   const resolvedCwd = path.resolve(cwd);
   const aliasName = path.basename(resolvedCwd) || "project";
@@ -412,7 +314,7 @@ function defaultRuntimeConfigTemplate(cwd: string) {
     },
     conversationProvider: "codex-desktop",
     accessControl: {
-      mode: "allow-all",
+      mode: "deny-by-default",
       allowedAccountKeys: [],
       allowedC2cSenderIds: [],
       allowedGroupIds: [],
@@ -427,114 +329,6 @@ function defaultRuntimeConfigTemplate(cwd: string) {
       }
     }
   };
-}
-
-async function stopRuntime(options: {
-  env: NodeJS.ProcessEnv;
-  writeStdout: (line: string) => void;
-  writeStderr: (line: string) => void;
-  allowNotRunning?: boolean;
-  waitForExit?: boolean;
-}): Promise<number> {
-  const paths = runtimePaths(options.env);
-  const status = readRuntimeStatus(paths);
-  if (!status.pid || !status.running) {
-    if (status.pid) {
-      clearRuntimeState(paths, status.pid);
-    }
-    writeJsonLine(options.writeStdout, {
-      status: "not_running",
-      runtime: readRuntimeStatus(paths)
-    });
-    return options.allowNotRunning ? 0 : 1;
-  }
-
-  try {
-    if (!(await canReachRuntimeControl(paths, status.state, "/control/stop", "POST"))) {
-      clearRuntimeState(paths, status.pid);
-      writeJsonLine(options.writeStdout, {
-        status: "not_running",
-        runtime: readRuntimeStatus(paths)
-      });
-      return options.allowNotRunning ? 0 : 1;
-    }
-
-    if (options.waitForExit) {
-      const exited = await waitForRuntimeExit(paths, status.pid);
-      if (!exited) {
-        options.writeStderr(`${LOG_PREFIX} timed out waiting for pid=${status.pid} to stop`);
-        return 1;
-      }
-    }
-    writeJsonLine(options.writeStdout, {
-      status: options.waitForExit ? "stopped" : "stopping",
-      pid: status.pid
-    });
-    return 0;
-  } catch (error) {
-    options.writeStderr(error instanceof Error ? error.message : String(error));
-    return 1;
-  }
-}
-
-async function canReachRuntimeControl(
-  paths: ReturnType<typeof runtimePaths>,
-  state: ReturnType<typeof readRuntimeStatus>["state"],
-  routePath: string,
-  method: "GET" | "POST"
-): Promise<boolean> {
-  const token = readManagementToken(paths);
-  if (!token || !state) {
-    return false;
-  }
-
-  try {
-    const response = await fetch(`http://${formatHttpHost(state.listenHost)}:${state.listenPort}${routePath}`, {
-      method,
-      headers: {
-        "x-qq-codex-token": token
-      },
-      signal: AbortSignal.timeout(1_000)
-    });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
-function readManagementToken(paths: ReturnType<typeof runtimePaths>): string | null {
-  if (!fs.existsSync(paths.tokenPath)) {
-    return null;
-  }
-
-  const token = fs.readFileSync(paths.tokenPath, "utf8").trim();
-  return token || null;
-}
-
-function formatHttpHost(host: string): string {
-  if (host === "0.0.0.0") {
-    return "127.0.0.1";
-  }
-  if (host === "::") {
-    return "[::1]";
-  }
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-}
-
-async function waitForRuntimeExit(
-  paths: ReturnType<typeof runtimePaths>,
-  pid: number,
-  timeoutMs = 10_000
-): Promise<boolean> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const status = readRuntimeStatus(paths);
-    if (!status.running || status.pid !== pid) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  return false;
 }
 
 function readPackageVersion(packageRoot: string): string {

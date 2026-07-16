@@ -10,7 +10,7 @@ Turn Manager 负责：
 - 调度：session 队列、Codex thread 锁，以及可选的 desktop 全局锁。
 - 事件归一：用户输入、Codex delta、工具事件、完成、取消、超时、投递结果和重启恢复。
 - 状态协调：bridge turn id、Codex turn id、session/thread 绑定、原始消息 id、时间戳、最后事件/工具/错误，以及已投递输出进度。
-- 控制动作：当前任务、最近任务、取消，以及未来的重试。
+- 控制动作：当前任务、最近任务、取消和基于原始入站消息创建新 turn 的重试。
 - 超时：为 running turn 写入 `deadlineAt`，到达硬 deadline 后标记 `timed-out`。
 - 恢复：把遗留 active work 标记为 `timed-out` 或 `orphaned`，然后释放本地锁。
 
@@ -103,5 +103,8 @@ terminal -> terminal events are ignored
 11. `DeliveryQuery`：集中处理投递队列查询和 delivery job 展示，已抽出。
 12. `CommandPresenter`：集中处理帮助、账号状态、线程列表、项目/别名等命令展示，已抽出到命令层。
 13. `CommandClassifier`：集中处理命令识别、正则匹配和参数提取，已抽出到命令层。
+14. `TurnRetry`：校验失败任务、恢复原始入站消息并创建新的重试消息，已接入 `/retry`。
+15. 工具事件历史：`bridge_turn_events` 持久化工具名、状态、摘要和错误，CLI `task` 可查询。
+16. Thread lock lease：持久锁不会覆盖未过期 owner，并在长任务期间自动续租。
 
 这样 Turn Manager 是调度中心，不是杂物堆。

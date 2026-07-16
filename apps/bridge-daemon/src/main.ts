@@ -73,7 +73,7 @@ export function createIngressMessageHandler(deps: IngressMessageHandlerDeps) {
           sessionKey: message.sessionKey,
           text: buildBridgeErrorReplyText(error, errorMessage),
           createdAt: new Date().toISOString(),
-          replyToMessageId: message.messageId
+          replyToMessageId: message.replyToMessageId ?? message.messageId
         };
         try {
           await deps.transcriptStore?.recordOutbound(errorDraft);
@@ -129,6 +129,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     if (!orchestrator) {
       throw new Error(`missing orchestrator for ${accountKey}`);
     }
+    let ingressHandler!: ReturnType<typeof createIngressMessageHandler>;
     const threadCommandHandler = new ThreadCommandHandler({
       sessionStore: app.sessionStore,
       transcriptStore: app.transcriptStore,
@@ -138,20 +139,24 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       qqEgress: adapter.egress,
       chatgptDriver: app.chatgptDriver,
       accountKeys: configuredAccountKeys,
-      projectAliases: app.config.projectAliases
+      projectAliases: app.config.projectAliases,
+      retryInbound: (retryMessage) => {
+        void ingressHandler(retryMessage);
+      }
+    });
+    ingressHandler = createIngressMessageHandler({
+      threadCommandHandler,
+      orchestrator,
+      errorEgress: adapter.egress,
+      transcriptStore: app.transcriptStore,
+      deliveryJobStore: app.deliveryJobStore,
+      accessControl: app.config.accessControl,
+      onRejected: logRejectedInbound
     });
     return {
       accountKey,
       adapter,
-      ingressHandler: createIngressMessageHandler({
-        threadCommandHandler,
-        orchestrator,
-        errorEgress: adapter.egress,
-        transcriptStore: app.transcriptStore,
-        deliveryJobStore: app.deliveryJobStore,
-        accessControl: app.config.accessControl,
-        onRejected: logRejectedInbound
-      })
+      ingressHandler
     };
   });
   const weixinRoutes = Object.entries(app.adapters.weixinByAccountKey).map(([accountKey, adapter]) => {
@@ -159,6 +164,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
     if (!orchestrator) {
       throw new Error(`missing orchestrator for ${accountKey}`);
     }
+    let ingressHandler!: ReturnType<typeof createIngressMessageHandler>;
     const threadCommandHandler = new ThreadCommandHandler({
       sessionStore: app.sessionStore,
       transcriptStore: app.transcriptStore,
@@ -168,20 +174,24 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       qqEgress: adapter.egress,
       chatgptDriver: app.chatgptDriver,
       accountKeys: configuredAccountKeys,
-      projectAliases: app.config.projectAliases
+      projectAliases: app.config.projectAliases,
+      retryInbound: (retryMessage) => {
+        void ingressHandler(retryMessage);
+      }
+    });
+    ingressHandler = createIngressMessageHandler({
+      threadCommandHandler,
+      orchestrator,
+      errorEgress: adapter.egress,
+      transcriptStore: app.transcriptStore,
+      deliveryJobStore: app.deliveryJobStore,
+      accessControl: app.config.accessControl,
+      onRejected: logRejectedInbound
     });
     return {
       accountKey,
       adapter,
-      ingressHandler: createIngressMessageHandler({
-        threadCommandHandler,
-        orchestrator,
-        errorEgress: adapter.egress,
-        transcriptStore: app.transcriptStore,
-        deliveryJobStore: app.deliveryJobStore,
-        accessControl: app.config.accessControl,
-        onRejected: logRejectedInbound
-      })
+      ingressHandler
     };
   });
   const bridgeHttpServer = createBridgeHttpServer([

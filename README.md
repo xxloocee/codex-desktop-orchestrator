@@ -83,6 +83,16 @@ ChatGPT Desktop 相关 adapter 与本地 CLI 代码作为历史遗留的可选 p
 | 查看当前运行状态 | `/status` | `/st` |
 | 查看帮助 | `/help` | `/h` |
 
+### 管理长任务
+
+| 用途 | 命令 |
+| --- | --- |
+| 查看当前任务 | `/task current` |
+| 查看最近任务 | `/tasks` |
+| 取消当前或指定任务 | `/cancel [taskId]` |
+| 重试失败、超时或 orphaned 任务 | `/retry <taskId>` |
+| 查看失败或待重试投递 | `/deliveries` |
+
 ### 媒体、语音和文件
 
 QQ 通道当前支持：
@@ -99,7 +109,7 @@ QQ 通道当前支持：
 - 多 QQ Bot / 多账号接入
 - 多微信账号配置
 - 私聊、群聊、群成员、mention 规则过滤
-- 默认兼容旧行为：未显式配置访问控制时允许全部；配置 allowlist 后进入收紧模式
+- 默认启用 `deny-by-default`；只有显式 allowlist 中的来源可以调度本机 Codex
 
 ## 快速开始
 
@@ -131,9 +141,11 @@ npx codex-desktop-orchestrator init
 ```env
 QQBOT_APP_ID=你的AppID
 QQBOT_CLIENT_SECRET=你的ClientSecret
+QQ_CODEX_ALLOWED_C2C_SENDERS=你的QQ用户OpenID
 ```
 
 QQ Bot 可以在 [QQ 开放平台](https://q.qq.com/qqbot/openclaw/index.html) 创建并获取 AppID / AppSecret。
+默认访问控制为 `deny-by-default`；如果不配置 allowlist，bridge 会启动，但不会接受聊天侧任务。
 
 ### 4. 构建并启动
 
@@ -148,9 +160,15 @@ pnpm start
 pnpm start -- status
 pnpm start -- doctor
 pnpm start -- logs 200
+pnpm start -- tasks 20
+pnpm start -- task <taskId>
+pnpm start -- deliveries 20
 pnpm start -- stop
 pnpm start -- restart
 ```
+
+默认 turn 硬超时为 30 分钟，工具连续 5 分钟无事件会被中断。可通过
+`QQ_CODEX_TURN_TIMEOUT_MS` 和 `CODEX_TOOL_SILENCE_TIMEOUT_MS` 调整。
 
 本地 smoke 测试时可以禁用 QQ gateway：
 
@@ -192,7 +210,7 @@ QQ_CODEX_PROJECT_ALIASES_JSON={"codex-desktop-orchestrator":{"cwd":"D:/Project/g
 
 ### 访问控制
 
-默认未配置访问控制时允许所有消息进入。配置 allowlist 后会自动进入 `deny-by-default`：
+默认使用 `deny-by-default`。至少配置一个允许的私聊发送者、群或群成员：
 
 ```env
 QQ_CODEX_ALLOWED_C2C_SENDERS=OPENID1,OPENID2
@@ -205,6 +223,8 @@ QQ_CODEX_GROUP_REQUIRE_MENTION=true
 ```env
 QQ_CODEX_ACCESS_CONTROL=deny-by-default
 ```
+
+只有明确设置 `QQ_CODEX_ACCESS_CONTROL=allow-all` 才会放开全部来源；`doctor` 会对此给出安全警告。
 
 ### 微信文本网关
 
@@ -252,7 +272,7 @@ Codex app-server driver
 Codex Desktop threads and tool calls
 ```
 
-当前实现已经具备桥接、线程绑定、项目别名、媒体上下文和 daemon 管理能力。后续演进重点是把一次 Codex 回合从“黑盒等待”升级成“可调度任务”。
+当前实现已经把 Codex 回合纳入任务状态、session/thread 调度、工具事件、取消、超时、重试、投递重试和重启恢复链路。
 
 更多调度能力设计见 [可调度 Codex 的 QQ Bot 能力说明](./docs/codex-orchestrated-qq-bot.md)。
 
@@ -269,17 +289,18 @@ Codex Desktop threads and tool calls
 - STT 语音转写
 - ChatGPT Desktop 可选历史 provider
 - runtime config、state、log、management token
-- CLI `start/status/doctor/logs/stop/restart/init`
+- Turn Manager 状态机、session 队列和可续租 thread lock
+- 工具事件记录、长任务心跳、hard timeout 和 tool silence timeout
+- `/tasks`、`/task current`、`/cancel`、`/retry`、`/deliveries`
+- Delivery Worker 重试和 daemon 重启恢复
+- CLI `start/status/doctor/logs/tasks/task/deliveries/stop/restart/init`
 - 访问控制和多账号配置
 
-仍在演进：
+当前边界：
 
-- 完整 Turn Manager
-- 工具调用事件监听
-- 长任务进度回传
-- 同一 Codex thread 的严格并发保护
-- 可取消、可重试、可恢复的任务队列
-- 真正消费和更新状态的 Delivery Worker
+- 重试会创建新 turn，不会恢复旧 Codex turn 的进程状态
+- daemon 重启后会将未完成任务收口为 `timed-out` 或 `orphaned`，不会自动续跑
+- 工具进度采用事件记录和节流心跳，不会把完整工具日志刷到聊天窗口
 - 飞书、Telegram 等更多平台入口
 
 ## 开发
