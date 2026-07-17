@@ -2,9 +2,18 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadConfig, loadConfigFromEnv } from "../../apps/bridge-daemon/src/config.js";
+import {
+  loadConfig,
+  loadConfigFromEnv,
+  resolveConfigPath
+} from "../../apps/bridge-daemon/src/config.js";
 
 describe("bridge config", () => {
+  it("honors a custom runtime config path", () => {
+    expect(resolveConfigPath({ QQ_CODEX_CONFIG_PATH: "D:/runtime/custom-config.json" }))
+      .toBe("D:/runtime/custom-config.json");
+  });
+
   it("keeps legacy single qq and weixin envs as default accounts", () => {
     const config = loadConfigFromEnv({
       QQBOT_APP_ID: "qq-app",
@@ -36,19 +45,22 @@ describe("bridge config", () => {
         requireMentionInGroup: true
       })
     );
+    expect(config.codexDesktop.permissionMode).toBe("full");
   });
 
   it("infers deny-by-default when access control env lists are configured", () => {
     const config = loadConfigFromEnv({
       QQBOT_APP_ID: "qq-app",
       QQBOT_CLIENT_SECRET: "qq-secret",
-      QQ_CODEX_ALLOWED_C2C_SENDERS: "OPENID1"
+      QQ_CODEX_ALLOWED_C2C_SENDERS: "OPENID1",
+      QQ_CODEX_PERMISSION_ADMIN_SENDERS: "OPENID1"
     });
 
     expect(config.accessControl).toEqual(
       expect.objectContaining({
         mode: "deny-by-default",
-        allowedC2cSenderIds: ["OPENID1"]
+        allowedC2cSenderIds: ["OPENID1"],
+        permissionAdminSenderIds: ["OPENID1"]
       })
     );
   });
@@ -140,7 +152,8 @@ describe("bridge config", () => {
         },
         codexDesktop: {
           appName: "Codex",
-          remoteDebuggingPort: 9229
+          remoteDebuggingPort: 9229,
+          permissionMode: "reviewed"
         },
         conversationProvider: "codex-desktop",
         accessControl: {
@@ -161,6 +174,7 @@ describe("bridge config", () => {
     expect(config.databasePath).toBe("runtime/from-config.sqlite");
     expect(config.runtime.listenPort).toBe(3999);
     expect(config.runtime.turnTimeoutMs).toBe(7777);
+    expect(config.codexDesktop.permissionMode).toBe("reviewed");
     expect(config.qqBots).toEqual([
       expect.objectContaining({
         accountId: "main",

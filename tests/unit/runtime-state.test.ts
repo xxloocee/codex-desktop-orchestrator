@@ -5,6 +5,18 @@ import { describe, expect, it } from "vitest";
 import { readRuntimeStatus, runtimePaths, writeRuntimeState } from "../../apps/bridge-daemon/src/runtime-state.js";
 
 describe("runtime state", () => {
+  it("reports the custom runtime config path without moving other runtime files", () => {
+    const runtimeHome = fs.mkdtempSync(path.join(os.tmpdir(), "qq-codex-runtime-state-"));
+    const configPath = path.join(runtimeHome, "custom-config.json");
+    const paths = runtimePaths({
+      QQ_CODEX_RUNTIME_HOME: runtimeHome,
+      QQ_CODEX_CONFIG_PATH: configPath
+    });
+
+    expect(paths.configPath).toBe(configPath);
+    expect(paths.pidPath).toBe(path.join(runtimeHome, "runtime.pid"));
+  });
+
   it("clears stale pid and state files when the process is no longer running", () => {
     const runtimeHome = fs.mkdtempSync(path.join(os.tmpdir(), "qq-codex-runtime-state-"));
     const paths = runtimePaths({ QQ_CODEX_RUNTIME_HOME: runtimeHome });

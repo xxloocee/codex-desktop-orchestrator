@@ -310,13 +310,15 @@ function defaultRuntimeConfigTemplate(cwd: string) {
     codexDesktop: {
       appName: "Codex",
       remoteDebuggingPort: 9229,
-      cwd: null
+      cwd: null,
+      permissionMode: "full"
     },
     conversationProvider: "codex-desktop",
     accessControl: {
       mode: "deny-by-default",
       allowedAccountKeys: [],
       allowedC2cSenderIds: [],
+      permissionAdminSenderIds: [],
       allowedGroupIds: [],
       allowedGroupMemberIds: [],
       requireMentionInGroup: true,

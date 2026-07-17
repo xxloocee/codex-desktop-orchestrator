@@ -3,6 +3,10 @@ export type DriverBinding = {
   codexThreadRef: string | null;
 };
 
+export const CODEX_PERMISSION_MODES = ["full", "reviewed", "workspace"] as const;
+
+export type CodexPermissionMode = (typeof CODEX_PERMISSION_MODES)[number];
+
 export type CodexThreadSummary = {
   index: number;
   title: string;

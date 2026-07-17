@@ -1,3 +1,5 @@
+import type { CodexPermissionMode } from "../../../packages/domain/src/driver.js";
+
 export type ThreadCommandRoute =
   | { kind: "not-command" }
   | { kind: "unknown"; text: string }
@@ -20,6 +22,8 @@ export type ThreadCommandRoute =
   | { kind: "model-switch"; targetModel: string }
   | { kind: "quota" }
   | { kind: "status" }
+  | { kind: "permission-current" }
+  | { kind: "permission-switch"; mode: CodexPermissionMode }
   | { kind: "code-review" }
   | { kind: "thread-use"; index: number }
   | { kind: "thread-new"; title: string }
@@ -127,6 +131,14 @@ export function routeThreadCommand(text: string): ThreadCommandRoute {
   if (text === "/status" || text === "/st") {
     return { kind: "status" };
   }
+  if (text === "/permission" || text === "/permissions" || text === "/pm") {
+    return { kind: "permission-current" };
+  }
+
+  const permissionMode = matchPermissionModeCommand(text);
+  if (permissionMode) {
+    return { kind: "permission-switch", mode: permissionMode };
+  }
   if (text === "/代码审查") {
     return { kind: "code-review" };
   }
@@ -169,6 +181,17 @@ export function matchChatgptUseCommand(text: string): number | null {
 
 export function matchSwitchModelCommand(text: string): string | null {
   return stringMatch(text, /^(?:\/model\s+use|\/mu)\s+(.+)$/);
+}
+
+export function matchPermissionModeCommand(text: string): CodexPermissionMode | null {
+  const value = stringMatch(
+    text,
+    /^\/(?:permission|permissions|pm)\s+(full|reviewed|workspace|safe)$/
+  );
+  if (value === "safe") {
+    return "workspace";
+  }
+  return value as CodexPermissionMode | null;
 }
 
 export function matchUseThreadCommand(text: string): number | null {

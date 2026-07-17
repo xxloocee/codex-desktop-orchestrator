@@ -6,6 +6,8 @@
 
 ### Added
 
+- QQ `/permission`、`/pm` 权限模式查询与管理员切换，支持 `full`、`reviewed`、`workspace`。
+- Codex app-server turn 级权限覆盖，默认使用无人值守的完全访问模式。
 - `/retry <taskId>`：从失败、超时或 orphaned 任务的原始入站消息创建新 turn。
 - CLI `tasks`、`task <taskId>`、`deliveries` 运维查询。
 - `bridge_turn_events` 工具事件历史与 task 级查询。

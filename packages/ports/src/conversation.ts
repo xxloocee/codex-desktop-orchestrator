@@ -1,4 +1,9 @@
-import type { CodexControlState, CodexThreadSummary, DriverBinding } from "../../domain/src/driver.js";
+import type {
+  CodexControlState,
+  CodexPermissionMode,
+  CodexThreadSummary,
+  DriverBinding
+} from "../../domain/src/driver.js";
 import type { InboundMessage, OutboundDraft, TurnEvent } from "../../domain/src/message.js";
 
 export type ConversationRunOptions = {
@@ -15,6 +20,8 @@ export type OpenSessionOptions = {
 
 export interface DesktopDriverPort {
   shutdown?(): Promise<void>;
+  getPermissionMode?(): CodexPermissionMode;
+  setPermissionMode?(mode: CodexPermissionMode): void;
   ensureAppReady(): Promise<void>;
   getControlState(binding?: DriverBinding | null): Promise<CodexControlState>;
   getQuotaSummary(): Promise<string | null>;

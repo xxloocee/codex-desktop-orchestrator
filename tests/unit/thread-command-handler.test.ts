@@ -1690,4 +1690,76 @@ describe("thread command handler", () => {
       null
     );
   });
+
+  it("reports the current Codex permission mode", async () => {
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore: createSessionStore(),
+      transcriptStore: createTranscriptStore(),
+      desktopDriver: createDriver(),
+      qqEgress,
+      permissionModeControl: {
+        getMode: () => "full",
+        setMode: vi.fn().mockResolvedValue(undefined)
+      }
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/permission"))).resolves.toBe(true);
+
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("完全访问（full）")
+      })
+    );
+  });
+
+  it("switches and persists the Codex permission mode through the control dependency", async () => {
+    const setMode = vi.fn().mockResolvedValue(undefined);
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore: createSessionStore(),
+      transcriptStore: createTranscriptStore(),
+      desktopDriver: createDriver(),
+      qqEgress,
+      permissionModeControl: {
+        getMode: () => "full",
+        setMode
+      },
+      canSwitchPermissionMode: () => true
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/pm reviewed"))).resolves.toBe(true);
+
+    expect(setMode).toHaveBeenCalledWith("reviewed");
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("自动审核（reviewed）")
+      })
+    );
+  });
+
+  it("rejects permission mode changes from non-admin users", async () => {
+    const setMode = vi.fn().mockResolvedValue(undefined);
+    const qqEgress = createEgress();
+    const handler = new ThreadCommandHandler({
+      sessionStore: createSessionStore(),
+      transcriptStore: createTranscriptStore(),
+      desktopDriver: createDriver(),
+      qqEgress,
+      permissionModeControl: {
+        getMode: () => "full",
+        setMode
+      },
+      canSwitchPermissionMode: () => false
+    });
+
+    await expect(handler.handleIfCommand(createPrivateMessage("/pm full"))).resolves.toBe(true);
+
+    expect(setMode).not.toHaveBeenCalled();
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("权限管理员")
+      })
+    );
+  });
 });

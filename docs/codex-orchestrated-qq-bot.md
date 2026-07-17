@@ -152,9 +152,21 @@ QQ 侧至少需要这些控制命令：
 /cancel <taskId>    取消指定任务
 /retry <taskId>     重试失败任务
 /new <alias> <task> 在指定项目中新建 Codex thread 并启动任务
+/permission         查看当前 Codex 权限模式
+/permission <mode>  切换 full、reviewed 或 workspace 模式
 ```
 
 取消命令应能打断正在执行的 Codex turn，并清理本地锁。重试命令应新建 turn，不要复用已经状态不明的 pending turn。
+
+远程控制不能依赖 Codex Desktop 的人工审批弹窗。Bridge 应在 `turn/start` 时显式传入权限策略，并允许通过 QQ 调整：
+
+- `full`：`never + dangerFullAccess`，默认模式，适合无人值守远程控制。
+- `reviewed`：`on-request + workspaceWrite + auto_review`，越权动作由自动审核处理。
+- `workspace`：`never + workspaceWrite`，越权动作直接失败。
+
+权限切换需要持久化到 runtime config，并从下一条 Codex turn 开始生效。
+切换属于全局高权限操作，只允许
+`accessControl.permissionAdminSenderIds` 中显式配置的 C2C 用户执行；群聊用户和普通授权用户只能查询。
 
 ### 6. Delivery Worker
 

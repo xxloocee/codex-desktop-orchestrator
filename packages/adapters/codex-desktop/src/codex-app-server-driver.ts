@@ -6,6 +6,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import WebSocket from "ws";
 import {
   type CodexControlState,
+  type CodexPermissionMode,
   type CodexThreadSummary,
   DesktopDriverError,
   type DriverBinding
@@ -191,6 +192,7 @@ type CodexAppServerDriverOptions = {
   staleTurnInterruptMs?: number;
   toolSilenceTimeoutMs?: number;
   defaultCwd?: string | null;
+  permissionMode?: CodexPermissionMode;
   sleep?: (ms: number) => Promise<void>;
   createWebSocket?: (url: string) => CodexAppServerSocket;
   controlFallback?: Pick<
@@ -217,6 +219,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
   private readonly externalAppServerUrl: string | null;
   private readonly codexBinaryPath: string;
   private readonly defaultCwd: string | null;
+  private permissionMode: CodexPermissionMode;
   private appServerUrl: string | null = null;
   private child: ChildProcess | null = null;
   private managedAppServerStartError: Error | null = null;
@@ -247,6 +250,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       ?? process.env.CODEX_BINARY_PATH
       ?? resolveDefaultCodexBinaryPath();
     this.defaultCwd = normalizeCwd(options.defaultCwd ?? process.env.CODEX_WORKSPACE_CWD ?? null);
+    this.permissionMode = options.permissionMode ?? "full";
     this.connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
     this.replyTimeoutMs = options.replyTimeoutMs ?? 0;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
@@ -263,6 +267,14 @@ export class CodexAppServerDriver implements DesktopDriverPort {
       ((url) => new WebSocket(url) as unknown as CodexAppServerSocket);
     this.controlFallback = options.controlFallback ?? null;
     this.notificationForwarder = options.notificationForwarder ?? null;
+  }
+
+  getPermissionMode(): CodexPermissionMode {
+    return this.permissionMode;
+  }
+
+  setPermissionMode(mode: CodexPermissionMode): void {
+    this.permissionMode = mode;
   }
 
   async ensureAppReady(): Promise<void> {
@@ -319,8 +331,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
         reasoningEffort: readString(effectiveConfig.model_reasoning_effort),
         workspace: controlThread?.cwd ? path.basename(controlThread.cwd) : null,
         branch: controlThread?.gitInfo?.branch ?? null,
-        permissionMode:
-          formatPermissionMode(effectiveConfig.approval_policy, effectiveConfig.sandbox_mode),
+        permissionMode: formatPermissionMode(this.permissionMode),
         quotaSummary
       };
     } catch {
@@ -490,6 +501,7 @@ export class CodexAppServerDriver implements DesktopDriverPort {
 
       const response = await this.request<TurnStartResponse>("turn/start", {
         threadId,
+        ...buildTurnPermissionOverrides(this.permissionMode),
         input: [
           {
             type: "text",
@@ -1675,12 +1687,44 @@ function isFailedToolItem(item: AppServerItem): boolean {
   return Boolean(status && /fail|error|cancel|timeout/i.test(status));
 }
 
-function formatPermissionMode(
-  approvalPolicy: unknown,
-  sandboxMode: unknown
-): string | null {
-  const parts = [readString(approvalPolicy), readString(sandboxMode)].filter(Boolean);
-  return parts.length > 0 ? parts.join(" / ") : null;
+function formatPermissionMode(mode: CodexPermissionMode): string {
+  switch (mode) {
+    case "full":
+      return "full / never / danger-full-access";
+    case "reviewed":
+      return "reviewed / on-request / workspace-write / auto-review";
+    case "workspace":
+      return "workspace / never / workspace-write";
+  }
+}
+
+function buildTurnPermissionOverrides(mode: CodexPermissionMode): Record<string, unknown> {
+  switch (mode) {
+    case "full":
+      return {
+        approvalPolicy: "never",
+        sandboxPolicy: { type: "dangerFullAccess" }
+      };
+    case "reviewed":
+      return {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "auto_review",
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          networkAccess: false,
+          writableRoots: []
+        }
+      };
+    case "workspace":
+      return {
+        approvalPolicy: "never",
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          networkAccess: false,
+          writableRoots: []
+        }
+      };
+  }
 }
 
 function formatRateLimitSnapshot(snapshot: RateLimitSnapshot | null | undefined): string | null {

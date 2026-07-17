@@ -46,6 +46,7 @@ const accessControlConfigSchema = z.object({
   mode: z.enum(["deny-by-default", "allow-all"]),
   allowedAccountKeys: z.array(z.string().min(1)),
   allowedC2cSenderIds: z.array(z.string().min(1)),
+  permissionAdminSenderIds: z.array(z.string().min(1)).default([]),
   allowedGroupIds: z.array(z.string().min(1)),
   allowedGroupMemberIds: z.array(z.string().min(1)),
   requireMentionInGroup: z.boolean(),
@@ -72,7 +73,8 @@ export const appConfigSchema = z.object({
   codexDesktop: z.object({
     appName: z.string().min(1),
     remoteDebuggingPort: z.number().int().positive(),
-    cwd: z.string().min(1).nullable()
+    cwd: z.string().min(1).nullable(),
+    permissionMode: z.enum(["full", "reviewed", "workspace"]).default("full")
   }),
   conversationProvider: z.enum(["codex-desktop", "chatgpt-desktop"]),
   accessControl: accessControlConfigSchema,
@@ -148,7 +150,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 }
 
 export function resolveConfigPath(env: NodeJS.ProcessEnv = process.env): string {
-  return env.QQ_CODEX_CONFIG_PATH?.trim() || runtimePaths(env).configPath;
+  return runtimePaths(env).configPath;
 }
 
 export function loadConfigFromEnv(env: NodeJS.ProcessEnv): AppConfig {
@@ -182,7 +184,8 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv): AppConfig {
     codexDesktop: {
       appName: env.CODEX_APP_NAME ?? "Codex",
       remoteDebuggingPort: Number(env.CODEX_REMOTE_DEBUGGING_PORT ?? "9229"),
-      cwd: env.CODEX_WORKSPACE_CWD ?? null
+      cwd: env.CODEX_WORKSPACE_CWD ?? null,
+      permissionMode: "full"
     },
     conversationProvider: (env.BRIDGE_CONVERSATION_PROVIDER === "chatgpt-desktop"
       ? "chatgpt-desktop"
@@ -234,7 +237,8 @@ function loadConfigFromEnvOrDefaults(env: NodeJS.ProcessEnv): AppConfig {
       codexDesktop: {
         appName: env.CODEX_APP_NAME ?? "Codex",
         remoteDebuggingPort: Number(env.CODEX_REMOTE_DEBUGGING_PORT ?? "9229"),
-        cwd: env.CODEX_WORKSPACE_CWD ?? null
+        cwd: env.CODEX_WORKSPACE_CWD ?? null,
+        permissionMode: "full"
       },
       conversationProvider: env.BRIDGE_CONVERSATION_PROVIDER === "chatgpt-desktop"
         ? "chatgpt-desktop"
@@ -267,13 +271,14 @@ function resolveProjectAliases(env: NodeJS.ProcessEnv): AppConfig["projectAliase
   );
 }
 
-function loadAccessControlFromEnv(env: NodeJS.ProcessEnv): BridgeAccessControlConfig {
+function loadAccessControlFromEnv(env: NodeJS.ProcessEnv): AppConfig["accessControl"] {
   return {
     mode: env.QQ_CODEX_ACCESS_CONTROL === "allow-all" || env.QQ_CODEX_ACCESS_CONTROL === "deny-by-default"
       ? env.QQ_CODEX_ACCESS_CONTROL
       : "deny-by-default",
     allowedAccountKeys: splitList(env.QQ_CODEX_ALLOWED_ACCOUNT_KEYS),
     allowedC2cSenderIds: splitList(env.QQ_CODEX_ALLOWED_C2C_SENDERS),
+    permissionAdminSenderIds: splitList(env.QQ_CODEX_PERMISSION_ADMIN_SENDERS),
     allowedGroupIds: splitList(env.QQ_CODEX_ALLOWED_GROUPS),
     allowedGroupMemberIds: splitList(env.QQ_CODEX_ALLOWED_GROUP_MEMBERS),
     requireMentionInGroup: env.QQ_CODEX_GROUP_REQUIRE_MENTION === "false" ? false : true,
@@ -285,10 +290,11 @@ function buildAccessControlConfig(
   config: Partial<BridgeAccessControlConfig> | undefined,
   fallback: BridgeAccessControlConfig,
   env: NodeJS.ProcessEnv
-): BridgeAccessControlConfig {
+): AppConfig["accessControl"] {
   const hasAccessControlEnv = Boolean(
     env.QQ_CODEX_ALLOWED_ACCOUNT_KEYS
       ?? env.QQ_CODEX_ALLOWED_C2C_SENDERS
+      ?? env.QQ_CODEX_PERMISSION_ADMIN_SENDERS
       ?? env.QQ_CODEX_ALLOWED_GROUPS
       ?? env.QQ_CODEX_ALLOWED_GROUP_MEMBERS
       ?? env.QQ_CODEX_GROUP_REQUIRE_MENTION
@@ -298,6 +304,8 @@ function buildAccessControlConfig(
     mode: config?.mode ?? fallback.mode,
     allowedAccountKeys: config?.allowedAccountKeys ?? fallback.allowedAccountKeys,
     allowedC2cSenderIds: config?.allowedC2cSenderIds ?? fallback.allowedC2cSenderIds,
+    permissionAdminSenderIds:
+      config?.permissionAdminSenderIds ?? fallback.permissionAdminSenderIds ?? [],
     allowedGroupIds: config?.allowedGroupIds ?? fallback.allowedGroupIds,
     allowedGroupMemberIds: config?.allowedGroupMemberIds ?? fallback.allowedGroupMemberIds,
     requireMentionInGroup: config?.requireMentionInGroup ?? fallback.requireMentionInGroup,
@@ -316,6 +324,9 @@ function buildAccessControlConfig(
     allowedC2cSenderIds: env.QQ_CODEX_ALLOWED_C2C_SENDERS
       ? splitList(env.QQ_CODEX_ALLOWED_C2C_SENDERS)
       : merged.allowedC2cSenderIds,
+    permissionAdminSenderIds: env.QQ_CODEX_PERMISSION_ADMIN_SENDERS
+      ? splitList(env.QQ_CODEX_PERMISSION_ADMIN_SENDERS)
+      : merged.permissionAdminSenderIds,
     allowedGroupIds: env.QQ_CODEX_ALLOWED_GROUPS
       ? splitList(env.QQ_CODEX_ALLOWED_GROUPS)
       : merged.allowedGroupIds,

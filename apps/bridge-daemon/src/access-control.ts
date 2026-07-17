@@ -4,11 +4,21 @@ export type BridgeAccessControlConfig = {
   mode: "deny-by-default" | "allow-all";
   allowedAccountKeys: string[];
   allowedC2cSenderIds: string[];
+  permissionAdminSenderIds?: string[];
   allowedGroupIds: string[];
   allowedGroupMemberIds: string[];
   requireMentionInGroup: boolean;
   botMentionPatterns: string[];
 };
+
+export function canChangePermissionMode(
+  message: InboundMessage,
+  config: BridgeAccessControlConfig | null | undefined
+): boolean {
+  return message.accountKey.startsWith("qqbot:")
+    && message.chatType === "c2c"
+    && Boolean(config?.permissionAdminSenderIds?.includes(message.senderId));
+}
 
 export type AccessDecision = {
   allowed: boolean;

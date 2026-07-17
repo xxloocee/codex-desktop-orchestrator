@@ -1,6 +1,9 @@
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { DesktopDriverError } from "../../../packages/domain/src/driver.js";
+import {
+  DesktopDriverError,
+  type CodexPermissionMode
+} from "../../../packages/domain/src/driver.js";
 import type {
   DeliveryRecord,
   InboundMessage,
@@ -13,9 +16,14 @@ import {
 } from "../../../packages/orchestrator/src/delivery-worker.js";
 import { TurnRecoveryController } from "../../../packages/orchestrator/src/turn-recovery-controller.js";
 import type { DeliveryJobStorePort, TranscriptStorePort } from "../../../packages/ports/src/store.js";
-import { authorizeInboundMessage, type AccessDecision } from "./access-control.js";
+import {
+  authorizeInboundMessage,
+  canChangePermissionMode,
+  type AccessDecision
+} from "./access-control.js";
 import { bootstrap, INTERNAL_TURN_EVENT_PATH } from "./bootstrap.js";
 import { updateRuntimeConfigFile } from "./config-management.js";
+import { resolveConfigPath } from "./config.js";
 import { createBridgeHttpServer } from "./http-server.js";
 import {
   clearRuntimeState,
@@ -114,6 +122,7 @@ export type BridgeRuntimeHandle = {
 export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
   const app = bootstrap();
   const paths = runtimePaths();
+  const configPath = resolveConfigPath(process.env);
   const managementToken = ensureManagementToken(paths);
   const recovery = new TurnRecoveryController({
     runtimeRecoveryStore: app.runtimeRecoveryStore
@@ -124,6 +133,27 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
   const managedServices: Array<Pick<WeixinGatewayServiceHandle, "shutdown">> = [];
   let runtimeHandle: BridgeRuntimeHandle | null = null;
   const configuredAccountKeys = Object.keys(app.orchestrators.byAccountKey);
+  const permissionModeControl = app.adapters.codexDesktop.getPermissionMode
+    && app.adapters.codexDesktop.setPermissionMode
+    ? {
+        getMode: () => app.adapters.codexDesktop.getPermissionMode!(),
+        setMode: async (mode: CodexPermissionMode) => {
+          const updated = updateRuntimeConfigFile({
+            configPath,
+            env: process.env,
+            patch: {
+              codexDesktop: {
+                permissionMode: mode
+              }
+            }
+          });
+          app.adapters.codexDesktop.setPermissionMode!(
+            updated.effectiveConfig.codexDesktop.permissionMode
+          );
+          app.config.codexDesktop.permissionMode = updated.effectiveConfig.codexDesktop.permissionMode;
+        }
+      }
+    : undefined;
   const qqIngressHandlers = Object.entries(app.adapters.qqByAccountKey).map(([accountKey, adapter]) => {
     const orchestrator = app.orchestrators.byAccountKey[accountKey];
     if (!orchestrator) {
@@ -140,6 +170,9 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       chatgptDriver: app.chatgptDriver,
       accountKeys: configuredAccountKeys,
       projectAliases: app.config.projectAliases,
+      permissionModeControl,
+      canSwitchPermissionMode: (message) =>
+        canChangePermissionMode(message, app.config.accessControl),
       retryInbound: (retryMessage) => {
         void ingressHandler(retryMessage);
       }
@@ -175,6 +208,9 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       chatgptDriver: app.chatgptDriver,
       accountKeys: configuredAccountKeys,
       projectAliases: app.config.projectAliases,
+      permissionModeControl,
+      canSwitchPermissionMode: (message) =>
+        canChangePermissionMode(message, app.config.accessControl),
       retryInbound: (retryMessage) => {
         void ingressHandler(retryMessage);
       }
@@ -234,7 +270,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       allowOnlyLocal: true,
       requiredToken: managementToken,
       dispatchPayload: async () => ({
-        configPath: paths.configPath,
+        configPath,
         restartRequired: false,
         config: redactConfig(app.config)
       })
@@ -247,7 +283,7 @@ export async function runBridgeDaemon(): Promise<BridgeRuntimeHandle> {
       respondWithJson: true,
       dispatchPayload: async (payload) => {
         const updated = updateRuntimeConfigFile({
-          configPath: paths.configPath,
+          configPath,
           env: process.env,
           patch: payload
         });

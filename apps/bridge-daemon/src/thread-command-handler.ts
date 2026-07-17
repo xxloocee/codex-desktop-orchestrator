@@ -34,6 +34,10 @@ import {
   type UnknownThreadCommandRoute
 } from "./command-execution-pipeline.js";
 import { DesktopControlCommandActions } from "./desktop-control-command-actions.js";
+import {
+  PermissionCommandActions,
+  type PermissionModeControl
+} from "./permission-command-actions.js";
 import { ProviderThreadCommandExecutor } from "./provider-thread-command-executor.js";
 import { SourceCommandActions } from "./source-command-actions.js";
 
@@ -49,6 +53,8 @@ type ThreadCommandHandlerDeps = {
   accountKeys?: string[];
   projectAliases?: AppConfig["projectAliases"];
   retryInbound?: (message: InboundMessage) => void;
+  permissionModeControl?: PermissionModeControl;
+  canSwitchPermissionMode?: (message: InboundMessage) => boolean;
 };
 
 export class ThreadCommandHandler {
@@ -58,6 +64,7 @@ export class ThreadCommandHandler {
   private readonly controlReplyDelivery: ControlReplyDelivery;
   private readonly desktopControlCommandActions: DesktopControlCommandActions;
   private readonly deliveryQuery: DeliveryQuery;
+  private readonly permissionCommandActions: PermissionCommandActions;
   private readonly providerThreadCommandExecutor: ProviderThreadCommandExecutor;
   private readonly sourceCommandActions: SourceCommandActions;
   private readonly turnControl: TurnControl;
@@ -83,6 +90,9 @@ export class ThreadCommandHandler {
       chatgptCommandActions,
       codexThreadCommandActions: this.codexThreadCommandActions
     });
+    this.permissionCommandActions = new PermissionCommandActions(
+      deps.permissionModeControl ?? null
+    );
     this.controlReplyDelivery = new ControlReplyDelivery({
       transcriptStore: deps.transcriptStore,
       qqEgress: deps.qqEgress,
@@ -220,6 +230,25 @@ export class ThreadCommandHandler {
         await this.deliverControlReply(
           message,
           await this.desktopControlCommandActions.buildStatusText(message.sessionKey)
+        );
+        return;
+      case "permission-current":
+        await this.deliverControlReply(
+          message,
+          this.permissionCommandActions.buildCurrentText()
+        );
+        return;
+      case "permission-switch":
+        if (!this.deps.canSwitchPermissionMode?.(message)) {
+          await this.deliverControlReply(
+            message,
+            "只有配置为权限管理员的私聊用户才能切换 Codex 权限模式。"
+          );
+          return;
+        }
+        await this.deliverControlReply(
+          message,
+          await this.permissionCommandActions.switchMode(route.mode)
         );
         return;
       case "code-review":

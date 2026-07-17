@@ -8,7 +8,8 @@ import {
   matchChatgptUseCommand,
   matchForkThreadCommand,
     matchNewProjectCommand,
-    matchNewThreadCommand,
+  matchNewThreadCommand,
+  matchPermissionModeCommand,
     matchRetryCommand,
   matchSourceCommand,
   matchSwitchModelCommand,
@@ -35,6 +36,9 @@ describe("command classifier", () => {
     expect(matchSourceCommand("/source chatgpt")).toBe("chatgpt");
     expect(matchChatgptUseCommand("/cgpt use 3")).toBe(3);
     expect(matchSwitchModelCommand("/mu GPT-5")).toBe("GPT-5");
+    expect(matchPermissionModeCommand("/permission full")).toBe("full");
+    expect(matchPermissionModeCommand("/pm reviewed")).toBe("reviewed");
+    expect(matchPermissionModeCommand("/pm safe")).toBe("workspace");
     expect(matchUseThreadCommand("/tu 2")).toBe(2);
     expect(matchNewThreadCommand("/tn My thread")).toBe("My thread");
     expect(matchRetryCommand("/retry bridge-turn-1")).toBe("bridge-turn-1");
@@ -69,6 +73,11 @@ describe("command classifier", () => {
     expect(routeThreadCommand("/retry turn-2")).toEqual({
       kind: "retry",
       taskId: "turn-2"
+    });
+    expect(routeThreadCommand("/permission")).toEqual({ kind: "permission-current" });
+    expect(routeThreadCommand("/pm workspace")).toEqual({
+      kind: "permission-switch",
+      mode: "workspace"
     });
   });
 });

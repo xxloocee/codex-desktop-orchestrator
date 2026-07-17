@@ -229,6 +229,121 @@ describe("codex app-server driver", () => {
     expect(binding.codexThreadRef).toContain("thread-new");
   });
 
+  it("starts turns with full permission by default and supports runtime mode changes", async () => {
+    const socket = new FakeAppServerSocket();
+    const turnStartParams: Array<Record<string, unknown>> = [];
+    let turnNumber = 0;
+    socket.onRequest("initialize", (message) => {
+      socket.respond(message.id, {
+        userAgent: "fake",
+        codexHome: "/tmp/codex",
+        platformFamily: "unix",
+        platformOs: "macos"
+      });
+    });
+    socket.onRequest("thread/resume", (message) => {
+      socket.respond(message.id, {});
+    });
+    socket.onRequest("thread/read", (message) => {
+      socket.respond(message.id, {
+        thread: {
+          id: "thread-target",
+          turns: []
+        }
+      });
+    });
+    socket.onRequest("turn/start", (message) => {
+      turnStartParams.push(message.params as Record<string, unknown>);
+      turnNumber += 1;
+      socket.respond(message.id, {
+        turn: {
+          id: `turn-target-${turnNumber}`
+        }
+      });
+    });
+
+    const driver = new CodexAppServerDriver({
+      appServerUrl: "ws://127.0.0.1:1",
+      createWebSocket: () => socket as never,
+      requestTimeoutMs: 1_000,
+      sleep: async () => undefined
+    });
+    const binding = {
+      sessionKey: "qqbot:default::qq:c2c:user-1",
+      codexThreadRef: "codex-app-thread:thread-target"
+    };
+
+    expect(driver.getPermissionMode()).toBe("full");
+    await driver.sendUserMessage(binding, {
+      messageId: "msg-1",
+      accountKey: "qqbot:default",
+      sessionKey: binding.sessionKey,
+      peerKey: "qq:c2c:user-1",
+      chatType: "c2c",
+      senderId: "user-1",
+      text: "hello",
+      receivedAt: "2026-04-21T14:30:00.000Z"
+    });
+
+    expect(turnStartParams[0]).toMatchObject({
+      threadId: "thread-target",
+      approvalPolicy: "never",
+      sandboxPolicy: {
+        type: "dangerFullAccess"
+      }
+    });
+    expect(turnStartParams[0]?.approvalsReviewer).toBeUndefined();
+
+    driver.setPermissionMode("reviewed");
+    expect(driver.getPermissionMode()).toBe("reviewed");
+    await driver.sendUserMessage(
+      { ...binding, sessionKey: `${binding.sessionKey}:reviewed` },
+      {
+        messageId: "msg-2",
+        accountKey: "qqbot:default",
+        sessionKey: `${binding.sessionKey}:reviewed`,
+        peerKey: "qq:c2c:user-1",
+        chatType: "c2c",
+        senderId: "user-1",
+        text: "reviewed",
+        receivedAt: "2026-04-21T14:31:00.000Z"
+      }
+    );
+    expect(turnStartParams[1]).toMatchObject({
+      approvalPolicy: "on-request",
+      approvalsReviewer: "auto_review",
+      sandboxPolicy: {
+        type: "workspaceWrite",
+        networkAccess: false,
+        writableRoots: []
+      }
+    });
+
+    driver.setPermissionMode("workspace");
+    await driver.sendUserMessage(
+      { ...binding, sessionKey: `${binding.sessionKey}:workspace` },
+      {
+        messageId: "msg-3",
+        accountKey: "qqbot:default",
+        sessionKey: `${binding.sessionKey}:workspace`,
+        peerKey: "qq:c2c:user-1",
+        chatType: "c2c",
+        senderId: "user-1",
+        text: "workspace",
+        receivedAt: "2026-04-21T14:32:00.000Z"
+      }
+    );
+    expect(turnStartParams[2]).toMatchObject({
+      approvalPolicy: "never",
+      sandboxPolicy: {
+        type: "workspaceWrite",
+        networkAccess: false,
+        writableRoots: []
+      }
+    });
+    expect(turnStartParams[2]?.approvalsReviewer).toBeUndefined();
+  });
+
   it("routes replies by thread id and turn id instead of the active desktop UI", async () => {
     const socket = new FakeAppServerSocket();
     socket.onRequest("initialize", (message) => {
@@ -1686,6 +1801,7 @@ describe("codex app-server driver", () => {
     const driver = new CodexAppServerDriver({
       appServerUrl: "ws://127.0.0.1:1",
       createWebSocket: () => socket as never,
+      permissionMode: "reviewed",
       requestTimeoutMs: 1_000,
       sleep: async () => undefined
     });
@@ -1702,7 +1818,7 @@ describe("codex app-server driver", () => {
       reasoningEffort: "high",
       workspace: "codex-desktop-orchestrator",
       branch: "codex/weixin-multi-channel",
-      permissionMode: "on-request / workspace-write"
+      permissionMode: "reviewed / on-request / workspace-write / auto-review"
     });
     expect(state.threadRef).toMatch(/^codex-app-thread:thread-bound:/);
     expect(state.quotaSummary).toContain("5 小时 65%");

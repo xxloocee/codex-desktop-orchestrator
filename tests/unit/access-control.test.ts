@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { InboundMessage } from "../../packages/domain/src/message.js";
-import { authorizeInboundMessage, type BridgeAccessControlConfig } from "../../apps/bridge-daemon/src/access-control.js";
+import {
+  authorizeInboundMessage,
+  canChangePermissionMode,
+  type BridgeAccessControlConfig
+} from "../../apps/bridge-daemon/src/access-control.js";
 
 const baseConfig: BridgeAccessControlConfig = {
   mode: "deny-by-default",
   allowedAccountKeys: [],
   allowedC2cSenderIds: [],
+  permissionAdminSenderIds: [],
   allowedGroupIds: [],
   allowedGroupMemberIds: [],
   requireMentionInGroup: true,
@@ -44,6 +49,25 @@ describe("access control", () => {
         allowedC2cSenderIds: ["OPENID123"]
       })
     ).toEqual(expect.objectContaining({ allowed: true, reason: "c2c_sender_allowed" }));
+  });
+
+  it("only lets explicitly configured private-chat admins change permission mode", () => {
+    const config = {
+      ...baseConfig,
+      allowedC2cSenderIds: ["OPENID123", "OPENID456"],
+      permissionAdminSenderIds: ["OPENID123"]
+    };
+
+    expect(canChangePermissionMode(message(), config)).toBe(true);
+    expect(canChangePermissionMode(message({ senderId: "OPENID456" }), config)).toBe(false);
+    expect(canChangePermissionMode(message({
+      chatType: "group",
+      senderId: "OPENID123"
+    }), config)).toBe(false);
+    expect(canChangePermissionMode(message({
+      accountKey: "weixin:default",
+      senderId: "OPENID123"
+    }), config)).toBe(false);
   });
 
   it("requires group messages to come from an allowlisted group or member and mention the bot", () => {

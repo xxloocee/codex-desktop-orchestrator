@@ -32,7 +32,7 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env): RuntimePaths
   const home = resolveRuntimeHome(env);
   return {
     home,
-    configPath: path.join(home, "config.json"),
+    configPath: env.QQ_CODEX_CONFIG_PATH?.trim() || path.join(home, "config.json"),
     pidPath: path.join(home, "runtime.pid"),
     tokenPath: path.join(home, "management-token"),
     statePath: path.join(home, "state.json"),

@@ -93,6 +93,7 @@ export function bootstrap() {
       ? legacyDomDriver
       : new CodexAppServerDriver({
           defaultCwd: config.codexDesktop.cwd,
+          permissionMode: config.codexDesktop.permissionMode,
           codexBinaryPath: codexInstallations.binaryPath,
           controlFallback: legacyDomDriver,
           notificationForwarder: forwardAppServerUiEvents

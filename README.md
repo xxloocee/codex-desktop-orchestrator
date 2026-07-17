@@ -81,7 +81,23 @@ ChatGPT Desktop 相关 adapter 与本地 CLI 代码作为历史遗留的可选 p
 | 切换模型 | `/model use <名称>` | `/mu <名称>` |
 | 查看额度信息 | `/quota` | `/q` |
 | 查看当前运行状态 | `/status` | `/st` |
+| 查看权限模式 | `/permission` | `/pm` |
+| 切换权限模式 | `/permission <full|reviewed|workspace>` | `/pm <模式>` |
 | 查看帮助 | `/help` | `/h` |
+
+权限模式默认是 `full`，用于无人值守的远程控制：
+
+- `full`：完全访问，不等待桌面人工审批。
+- `reviewed`：限制在工作区内，越权操作交给 Codex 自动审核。
+- `workspace`：限制在工作区内，网络、工作区外写入等越权操作直接失败。
+
+权限切换会写入 runtime config，并从下一条 Codex 任务开始生效。
+只有 `accessControl.permissionAdminSenderIds` 中显式配置的私聊用户可以切换；
+群聊和其他普通授权用户只能查询当前模式。也可以通过环境变量配置：
+
+```env
+QQ_CODEX_PERMISSION_ADMIN_SENDERS=你的QQ用户OpenID
+```
 
 ### 管理长任务
 
@@ -142,6 +158,7 @@ npx codex-desktop-orchestrator init
 QQBOT_APP_ID=你的AppID
 QQBOT_CLIENT_SECRET=你的ClientSecret
 QQ_CODEX_ALLOWED_C2C_SENDERS=你的QQ用户OpenID
+QQ_CODEX_PERMISSION_ADMIN_SENDERS=你的QQ用户OpenID
 ```
 
 QQ Bot 可以在 [QQ 开放平台](https://q.qq.com/qqbot/openclaw/index.html) 创建并获取 AppID / AppSecret。
@@ -214,6 +231,7 @@ QQ_CODEX_PROJECT_ALIASES_JSON={"codex-desktop-orchestrator":{"cwd":"D:/Project/g
 
 ```env
 QQ_CODEX_ALLOWED_C2C_SENDERS=OPENID1,OPENID2
+QQ_CODEX_PERMISSION_ADMIN_SENDERS=OPENID1
 QQ_CODEX_ALLOWED_GROUPS=GROUP_OPENID1
 QQ_CODEX_GROUP_REQUIRE_MENTION=true
 ```

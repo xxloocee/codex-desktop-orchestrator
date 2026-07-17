@@ -42,6 +42,9 @@ describe("config management", () => {
         runtime: {
           listenPort: 3999
         },
+        codexDesktop: {
+          permissionMode: "reviewed"
+        },
         accessControl: {
           allowedC2cSenderIds: ["OPENID1", "OPENID2"]
         }
@@ -51,13 +54,16 @@ describe("config management", () => {
     const saved = JSON.parse(fs.readFileSync(configPath, "utf8")) as {
       qqBot?: { clientSecret?: string };
       runtime?: { listenPort?: number };
+      codexDesktop?: { permissionMode?: string };
       accessControl?: { allowedC2cSenderIds?: string[] };
     };
 
     expect(saved.qqBot?.clientSecret).toBe("config-secret");
     expect(saved.runtime?.listenPort).toBe(3999);
+    expect(saved.codexDesktop?.permissionMode).toBe("reviewed");
     expect(saved.accessControl?.allowedC2cSenderIds).toEqual(["OPENID1", "OPENID2"]);
     expect(result.effectiveConfig.runtime.listenPort).toBe(3999);
+    expect(result.effectiveConfig.codexDesktop.permissionMode).toBe("reviewed");
     expect(result.effectiveConfig.qqBot.clientSecret).toBe("config-secret");
   });
 
