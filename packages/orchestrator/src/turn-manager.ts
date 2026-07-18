@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { buildMediaArtifactFromReference } from "../../adapters/qq/src/qq-media-parser.js";
 import type { DesktopDriverError } from "../../domain/src/driver.js";
 import type { OutboundDraft, TurnEvent } from "../../domain/src/message.js";
 import type { BridgeTurnStatus } from "../../domain/src/turn.js";
@@ -17,9 +18,6 @@ import {
   type TurnState
 } from "./turn-output-tracker.js";
 import { SessionTurnScheduler } from "./turn-scheduler.js";
-
-const PARTIAL_TURN_FLUSH_MIN_CHARS = 80;
-const PARTIAL_TURN_FLUSH_INTERVAL_MS = 3_000;
 
 export type TurnEventReduction = {
   status: BridgeTurnStatus;
@@ -48,6 +46,22 @@ export class TurnManager {
 
   getOrCreateOutputState(event: TurnEvent): TurnState {
     return this.outputTracker.getOrCreate(event);
+  }
+
+  beginOutputTurn(sessionKey: string, messageId: string): void {
+    this.outputTracker.beginTurn(sessionKey, messageId);
+  }
+
+  shouldIgnoreOutputEvent(event: TurnEvent): boolean {
+    return this.outputTracker.shouldIgnoreEvent(event);
+  }
+
+  hasObservedTurnEvent(sessionKey: string, turnId: string): boolean {
+    return this.outputTracker.hasObservedTurnEvent(sessionKey, turnId);
+  }
+
+  isLatestFinalFlushed(sessionKey: string): boolean {
+    return this.outputTracker.isLatestFinalFlushed(sessionKey);
   }
 
   recordDeliveredDraft(draft: OutboundDraft): void {
@@ -81,50 +95,13 @@ export class TurnManager {
     state.finalFlushed = true;
   }
 
-  buildPartialDraft(
-    event: TurnEvent,
-    state: TurnState,
-    draftFormatter: DraftFormatter
-  ): OutboundDraft | null {
-    const pendingText = computePendingTurnText(state.sentText, state.assembledText);
-    if (!pendingText.trim()) {
-      return null;
-    }
-
-    const eventAtMs = Date.parse(event.createdAt);
-    const hasEnoughText = pendingText.length >= PARTIAL_TURN_FLUSH_MIN_CHARS;
-    const hasWaited =
-      Number.isFinite(eventAtMs)
-      && state.lastPartialFlushAtMs !== null
-      && eventAtMs - state.lastPartialFlushAtMs >= PARTIAL_TURN_FLUSH_INTERVAL_MS
-      && pendingText.length >= 20;
-    if (!hasEnoughText && !hasWaited) {
-      return null;
-    }
-
-    const draft = draftFormatter(buildTurnEventDraft(event, pendingText));
-    if (isEmptyDraft(draft)) {
-      state.sentText = state.assembledText;
-      return null;
-    }
-
-    return draft;
-  }
-
-  markPartialDelivered(state: TurnState, draft: OutboundDraft, eventCreatedAt: string): void {
-    this.recordDeliveredDraft(draft);
-    state.sentText = state.assembledText;
-    const eventAtMs = Date.parse(eventCreatedAt);
-    state.lastPartialFlushAtMs = Number.isFinite(eventAtMs) ? eventAtMs : Date.now();
-  }
-
   buildFinalDraft(
     event: TurnEvent,
     state: TurnState,
     draftFormatter: DraftFormatter
   ): OutboundDraft | null {
     const pendingText = computePendingTurnText(state.sentText, state.assembledText);
-    if (!pendingText) {
+    if (!pendingText && !(event.payload.mediaReferences?.length)) {
       this.markFinalFlushed(state);
       return null;
     }
@@ -150,7 +127,6 @@ export class TurnManager {
 
   markFinalDelivered(state: TurnState, draft: OutboundDraft): void {
     this.recordDeliveredDraft(draft);
-    state.sentText = state.assembledText;
     this.markFinalFlushed(state);
   }
 
@@ -232,6 +208,13 @@ function buildTurnEventDraft(event: TurnEvent, text: string): OutboundDraft {
     turnId: event.turnId,
     sessionKey: event.sessionKey,
     text,
+    ...(event.payload.mediaReferences?.length
+      ? {
+          mediaArtifacts: event.payload.mediaReferences.map((reference) =>
+            buildMediaArtifactFromReference(reference)
+          )
+        }
+      : {}),
     createdAt: event.createdAt,
     ...(event.payload.deliveryReplyToMessageId ?? event.payload.replyToMessageId
       ? {

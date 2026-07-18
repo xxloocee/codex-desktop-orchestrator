@@ -2124,7 +2124,7 @@ describe("codex desktop driver contract", () => {
     ]);
   });
 
-  it("emits incremental drafts while the assistant reply grows across multiple phases", async () => {
+  it("emits one complete draft after the assistant reply stabilizes", async () => {
     const evaluateOnPage = vi
       .fn()
       .mockResolvedValueOnce({ reply: "old reply", isStreaming: false })
@@ -2190,9 +2190,7 @@ describe("codex desktop driver contract", () => {
     });
 
     expect(emitted).toMatchObject([
-      { text: "先回一句" },
-      { text: "继续补充" },
-      { text: "最终结论" }
+      { text: "先回一句\n继续补充\n最终结论" }
     ]);
     expect(finalDrafts).toEqual([]);
   });
@@ -2278,7 +2276,7 @@ describe("codex desktop driver contract", () => {
     expect(events.at(-1)?.payload.fullText).toContain("最终结论");
   });
 
-  it("emits newly discovered media references through onDraft even when no new text arrives", async () => {
+  it("includes newly discovered media references in the complete draft", async () => {
     const evaluateOnPage = vi
       .fn()
       .mockResolvedValueOnce({ reply: "old reply", isStreaming: false })
@@ -2372,9 +2370,8 @@ describe("codex desktop driver contract", () => {
     });
 
     expect(emitted).toMatchObject([
-      { text: "我先去外接硬盘里定位目录。" },
       {
-        text: "",
+        text: "我先去外接硬盘里定位目录。",
         mediaArtifacts: [
           expect.objectContaining({
             localPath: "/tmp/qq-media/final-a.png"
@@ -2483,8 +2480,14 @@ describe("codex desktop driver contract", () => {
     expect(localRolloutReader.waitForTurnCompletion).toHaveBeenCalled();
     expect(emitted).toMatchObject([
       {
-        text: "我先同步一下本地会话。",
-        turnId: "turn-local-123"
+        text:
+          "我先同步一下本地会话。\n最终结论\n<qqmedia>/tmp/final-image.png</qqmedia>",
+        turnId: "turn-local-123",
+        mediaArtifacts: [
+          expect.objectContaining({
+            localPath: "/tmp/final-image.png"
+          })
+        ]
       }
     ]);
     expect(finalDrafts).toEqual([]);
@@ -2847,10 +2850,13 @@ describe("codex desktop driver contract", () => {
     });
 
     expect(emitted).toMatchObject([
-      { text: "我先去外接硬盘里定位目录。" },
-      { text: "我在等全盘结果返回。" },
       {
-        text: "<qqmedia>/tmp/a.png</qqmedia>\n<qqmedia>/tmp/b.png</qqmedia>"
+        text: [
+          "我先去外接硬盘里定位目录。",
+          "我在等全盘结果返回。",
+          "<qqmedia>/tmp/a.png</qqmedia>",
+          "<qqmedia>/tmp/b.png</qqmedia>"
+        ].join("\n")
       }
     ]);
     expect(finalDrafts).toEqual([]);
@@ -2965,7 +2971,7 @@ describe("codex desktop driver contract", () => {
       }
     });
 
-    expect(emitted.length).toBeGreaterThanOrEqual(1);
+    expect(emitted).toHaveLength(1);
     expect(emitted.at(-1)?.text).toContain("按你的要求生成好了：");
     expect(emitted.at(-1)?.text).toContain("<qqmedia>/tmp/final-image.jpg</qqmedia>");
     expect(finalDrafts).toEqual([]);

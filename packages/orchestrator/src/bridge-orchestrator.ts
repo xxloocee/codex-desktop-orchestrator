@@ -35,7 +35,7 @@ type BridgeOrchestratorDeps = {
   interruptTurn?: (sessionKey: string) => Promise<boolean>;
 };
 
-const DEFAULT_TURN_HEARTBEAT_INTERVAL_MS = 2 * 60_000;
+const DEFAULT_TURN_HEARTBEAT_INTERVAL_MS = 5 * 60_000;
 
 export class BridgeOrchestrator {
   private readonly recentInboundFingerprints = new Map<
@@ -134,16 +134,19 @@ export class BridgeOrchestrator {
       },
       async () => {
         let deliverFinalStatusDraft: ((text: string) => Promise<void>) | null = null;
-        let stopTurnHeartbeat: (() => void) | null = null;
+        let stopTurnHeartbeat: (() => Promise<void>) | null = null;
         let turnCallbacksClosed = false;
         let hardTimeoutError: DesktopDriverError | null = null;
         try {
+          this.turnManager.beginOutputTurn(message.sessionKey, message.messageId);
           await this.turnManager.markRunning(bridgeTurnId);
           const deliveredDraftIds = new Set<string>();
           const deliveryErrors: string[] = [];
           let taskStartedDraftSent = false;
+          let heartbeatStarted = false;
+          let heartbeatClosed = false;
           let heartbeatTimer: NodeJS.Timeout | null = null;
-          let heartbeatCount = 0;
+          let heartbeatInFlight: Promise<void> | null = null;
           const handleDraft = async (
             draft: OutboundDraft,
             options: { allowTerminal?: boolean; ignoreClosed?: boolean } = {}
@@ -195,6 +198,15 @@ export class BridgeOrchestrator {
               });
             }
           };
+          const handleProviderDraft = async (draft: OutboundDraft) => {
+            if (
+              draft.turnId
+              && this.turnManager.hasObservedTurnEvent(draft.sessionKey, draft.turnId)
+            ) {
+              return;
+            }
+            await handleDraft(draft);
+          };
           const deliverStatusDraft = async (
             draftId: string,
             text: string,
@@ -216,21 +228,24 @@ export class BridgeOrchestrator {
             );
           };
           const startHeartbeat = () => {
-            if (heartbeatTimer || this.turnHeartbeatIntervalMs <= 0) {
+            if (heartbeatStarted || this.turnHeartbeatIntervalMs <= 0) {
               return;
             }
-            heartbeatTimer = setInterval(() => {
-              heartbeatCount += 1;
-              void (async () => {
-                const turn = await this.deps.turnStore?.getTurn(bridgeTurnId);
-                const text = turn?.lastToolName
-                  ? `任务仍在运行：${turn.lastToolName}`
-                  : "任务仍在运行。";
+            heartbeatStarted = true;
+            heartbeatTimer = setTimeout(() => {
+              heartbeatTimer = null;
+              heartbeatInFlight = this.deps.sessionStore.withSessionLock(message.sessionKey, async () => {
+                if (
+                  heartbeatClosed
+                  || this.turnManager.isLatestFinalFlushed(message.sessionKey)
+                ) {
+                  return;
+                }
                 await deliverStatusDraft(
-                  `task-heartbeat:${message.messageId}:${heartbeatCount}`,
-                  text
+                  `task-heartbeat:${message.messageId}`,
+                  "任务仍在运行，完成后会一次性回复。"
                 );
-              })().catch((error) => {
+              }).catch((error) => {
                 console.warn("[codex-desktop-orchestrator] task heartbeat failed", {
                   messageId: message.messageId,
                   sessionKey: message.sessionKey,
@@ -239,12 +254,13 @@ export class BridgeOrchestrator {
               });
             }, this.turnHeartbeatIntervalMs);
           };
-          stopTurnHeartbeat = () => {
-            if (!heartbeatTimer) {
-              return;
+          stopTurnHeartbeat = async () => {
+            heartbeatClosed = true;
+            if (heartbeatTimer) {
+              clearTimeout(heartbeatTimer);
+              heartbeatTimer = null;
             }
-            clearInterval(heartbeatTimer);
-            heartbeatTimer = null;
+            await heartbeatInFlight;
           };
           const deliverTaskStarted = async () => {
             if (taskStartedDraftSent) {
@@ -289,7 +305,7 @@ export class BridgeOrchestrator {
                 }
                 await this.deps.turnStore?.updateCodexThreadRef(bridgeTurnId, codexThreadRef);
               },
-              onDraft: handleDraft
+              onDraft: handleProviderDraft
             }),
             async (error) => {
               hardTimeoutError = error;
@@ -313,7 +329,7 @@ export class BridgeOrchestrator {
             await handleDraft(draft);
           }
 
-          stopTurnHeartbeat?.();
+          await stopTurnHeartbeat?.();
           await this.deps.sessionStore.updateSessionStatus(
             message.sessionKey,
             BridgeSessionStatus.Active,
@@ -328,7 +344,7 @@ export class BridgeOrchestrator {
           );
         } catch (error) {
           turnCallbacksClosed = true;
-          stopTurnHeartbeat?.();
+          await stopTurnHeartbeat?.();
           const lastError = error instanceof Error ? error.message : String(error);
           if (error instanceof DesktopDriverError && error.reason === "service_error") {
             await this.turnManager.markFailed(bridgeTurnId, lastError);
@@ -373,18 +389,19 @@ export class BridgeOrchestrator {
 
   async handleTurnEvent(event: TurnEvent): Promise<void> {
     await this.deps.sessionStore.withSessionLock(event.sessionKey, async () => {
-      const state = this.turnManager.getOrCreateOutputState(event);
-      if (event.sequence <= state.lastSequence) {
-        return;
-      }
-
       if (
-        await this.turnManager.shouldIgnoreCodexTurnEvent(
+        this.turnManager.shouldIgnoreOutputEvent(event)
+        || await this.turnManager.shouldIgnoreCodexTurnEvent(
           event.sessionKey,
           event.turnId,
           event.payload.replyToMessageId ?? null
         )
       ) {
+        return;
+      }
+
+      const state = this.turnManager.getOrCreateOutputState(event);
+      if (event.sequence <= state.lastSequence) {
         return;
       }
 
@@ -414,11 +431,6 @@ export class BridgeOrchestrator {
       this.turnManager.applyEventText(event, state);
 
       if (event.eventType === TurnEventType.Delta) {
-        const draft = this.turnManager.buildPartialDraft(event, state, this.draftFormatter);
-        if (draft) {
-          await this.turnDeliveryCoordinator.deliverCodexTurnEventDraft(event, draft);
-          this.turnManager.markPartialDelivered(state, draft, event.createdAt);
-        }
         return;
       }
 

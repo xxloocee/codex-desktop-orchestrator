@@ -329,28 +329,13 @@ describe("BridgeOrchestrator", () => {
     );
   });
 
-  it("sends heartbeat drafts while a turn is still running", async () => {
+  it("sends one generic progress draft while a turn is still running", async () => {
     vi.useFakeTimers();
     const message = createMessage({
       messageId: "retry:internal-1",
       replyToMessageId: "msg-retry-command-1"
     });
     const turnStore = createTurnStore();
-    vi.mocked(turnStore.getTurn).mockResolvedValue({
-      turnId: "bridge-turn-1",
-      sessionKey: message.sessionKey,
-      codexThreadRef: "thread-1",
-      codexTurnRef: "codex-turn-1",
-      qqMessageId: message.messageId,
-      status: BridgeTurnStatus.ToolRunning,
-      startedAt: message.receivedAt,
-      updatedAt: message.receivedAt,
-      deadlineAt: null,
-      lastEventAt: message.receivedAt,
-      lastToolName: "pnpm test",
-      lastError: null,
-      deliveredTextLength: 0
-    });
     const deferred = createDeferred<OutboundDraft[]>();
 
     const transcriptStore: TranscriptStorePort = {
@@ -398,17 +383,237 @@ describe("BridgeOrchestrator", () => {
     });
 
     const running = orchestrator.handleInbound(message);
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(150);
     deferred.resolve([]);
     await running;
 
-    expect(delivered.map((draft) => draft.text)).toContain("任务仍在运行：pnpm test");
+    expect(delivered.map((draft) => draft.text)).toEqual([
+      "任务已开始。",
+      "任务仍在运行，完成后会一次性回复。"
+    ]);
     expect(delivered).toContainEqual(
       expect.objectContaining({
         replyToMessageId: "msg-retry-command-1"
       })
     );
     vi.useRealTimers();
+  });
+
+  it("does not send delayed progress after the completed reply starts", async () => {
+    vi.useFakeTimers();
+    try {
+      const message = createMessage();
+      let session = createSession(message);
+      let lockTail = Promise.resolve();
+      const sessionStore: SessionStorePort = {
+        getSession: vi.fn(async () => session),
+        createSession: vi.fn(),
+        updateSessionStatus: vi.fn(),
+        updateBinding: vi.fn(),
+        updateLastCodexTurnId: vi.fn(async (_sessionKey, turnId) => {
+          session = { ...session, lastCodexTurnId: turnId };
+        }),
+        updateSkillContextKey: vi.fn(),
+        updateConversationProvider: vi.fn(),
+        withSessionLock: vi.fn(async (_sessionKey, work) => {
+          const previous = lockTail;
+          let release!: () => void;
+          const current = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          lockTail = previous.then(() => current);
+          await previous;
+          try {
+            return await work();
+          } finally {
+            release();
+          }
+        })
+      };
+      const transcriptStore: TranscriptStorePort = {
+        hasInbound: vi.fn().mockResolvedValue(false),
+        recordInbound: vi.fn(),
+        recordOutbound: vi.fn(),
+        listRecentConversation: vi.fn().mockResolvedValue([])
+      };
+      const turnStarted = createDeferred<void>();
+      const finishTurn = createDeferred<OutboundDraft[]>();
+      const conversationProvider: ConversationProviderPort = {
+        runTurn: vi.fn(async (_message, options) => {
+          await options?.onStarted?.();
+          turnStarted.resolve();
+          return finishTurn.promise;
+        })
+      };
+      const finalDeliveryStarted = createDeferred<void>();
+      const releaseFinalDelivery = createDeferred<void>();
+      const delivered: OutboundDraft[] = [];
+      const qqEgress: QqEgressPort = {
+        deliver: vi.fn(async (draft: OutboundDraft) => {
+          delivered.push(draft);
+          if (draft.text === "最终回复") {
+            finalDeliveryStarted.resolve();
+            await releaseFinalDelivery.promise;
+          }
+          return {
+            jobId: draft.draftId,
+            sessionKey: draft.sessionKey,
+            providerMessageId: null,
+            deliveredAt: draft.createdAt
+          };
+        })
+      };
+      const orchestrator = new BridgeOrchestrator({
+        sessionStore,
+        transcriptStore,
+        conversationProvider,
+        qqEgress,
+        turnHeartbeatIntervalMs: 50
+      });
+
+      await orchestrator.handleTurnEvent({
+        sessionKey: message.sessionKey,
+        turnId: "codex-turn-old",
+        sequence: 2,
+        eventType: TurnEventType.Delta,
+        createdAt: "2026-07-01T09:59:55.000Z",
+        isFinal: false,
+        payload: {
+          fullText: "old partial",
+          replyToMessageId: "msg-old"
+        }
+      });
+      const running = orchestrator.handleInbound(message);
+      await turnStarted.promise;
+      const completing = orchestrator.handleTurnEvent({
+        sessionKey: message.sessionKey,
+        turnId: "codex-turn-final",
+        sequence: 1,
+        eventType: TurnEventType.Completed,
+        createdAt: "2026-07-01T10:00:05.000Z",
+        isFinal: true,
+        payload: {
+          fullText: "最终回复",
+          replyToMessageId: message.messageId
+        }
+      });
+      await finalDeliveryStarted.promise;
+      const staleEvent = orchestrator.handleTurnEvent({
+        sessionKey: message.sessionKey,
+        turnId: "codex-turn-old",
+        sequence: 1,
+        eventType: TurnEventType.Delta,
+        createdAt: "2026-07-01T10:00:04.000Z",
+        isFinal: false,
+        payload: {
+          fullText: "old partial",
+          replyToMessageId: "msg-old"
+        }
+      });
+      await vi.advanceTimersByTimeAsync(50);
+      releaseFinalDelivery.resolve();
+      await Promise.all([completing, staleEvent]);
+      finishTurn.resolve([]);
+      await running;
+
+      expect(delivered.map((draft) => draft.text)).toEqual([
+        "任务已开始。",
+        "最终回复"
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a queued progress draft before sending recoverable terminal status", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const message = createMessage();
+      let lockTail = Promise.resolve();
+      const sessionStore: SessionStorePort = {
+        getSession: vi.fn().mockResolvedValue(createSession(message)),
+        createSession: vi.fn(),
+        updateSessionStatus: vi.fn(),
+        updateBinding: vi.fn(),
+        updateLastCodexTurnId: vi.fn(),
+        updateSkillContextKey: vi.fn(),
+        updateConversationProvider: vi.fn(),
+        withSessionLock: vi.fn(async (_sessionKey, work) => {
+          const previous = lockTail;
+          let release!: () => void;
+          const current = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          lockTail = previous.then(() => current);
+          await previous;
+          try {
+            return await work();
+          } finally {
+            release();
+          }
+        })
+      };
+      const transcriptStore: TranscriptStorePort = {
+        hasInbound: vi.fn().mockResolvedValue(false),
+        recordInbound: vi.fn(),
+        recordOutbound: vi.fn(),
+        listRecentConversation: vi.fn().mockResolvedValue([])
+      };
+      const turnStarted = createDeferred<void>();
+      const failTurn = createDeferred<void>();
+      const conversationProvider: ConversationProviderPort = {
+        runTurn: vi.fn(async (_message, options) => {
+          await options?.onStarted?.();
+          turnStarted.resolve();
+          await failTurn.promise;
+          throw new DesktopDriverError("reply timed out", "reply_timeout");
+        })
+      };
+      const delivered: OutboundDraft[] = [];
+      const qqEgress: QqEgressPort = {
+        deliver: vi.fn(async (draft: OutboundDraft) => {
+          delivered.push(draft);
+          return {
+            jobId: draft.draftId,
+            sessionKey: draft.sessionKey,
+            providerMessageId: null,
+            deliveredAt: draft.createdAt
+          };
+        })
+      };
+      const orchestrator = new BridgeOrchestrator({
+        sessionStore,
+        transcriptStore,
+        conversationProvider,
+        qqEgress,
+        turnHeartbeatIntervalMs: 50
+      });
+
+      const running = orchestrator.handleInbound(message);
+      await turnStarted.promise;
+      const lockEntered = createDeferred<void>();
+      const releaseLock = createDeferred<void>();
+      const blockingLock = sessionStore.withSessionLock(message.sessionKey, async () => {
+        lockEntered.resolve();
+        await releaseLock.promise;
+      });
+      await lockEntered.promise;
+      await vi.advanceTimersByTimeAsync(50);
+      failTurn.resolve();
+      await Promise.resolve();
+      releaseLock.resolve();
+      await blockingLock;
+      await running;
+
+      expect(delivered.map((draft) => draft.draftId)).toEqual([
+        `task-started:${message.messageId}`,
+        `task-ended:${message.messageId}`
+      ]);
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("marks the turn queued before the codex thread lock is acquired", async () => {
@@ -2094,7 +2299,7 @@ describe("BridgeOrchestrator", () => {
     expect(turnStore.addDeliveredText).toHaveBeenCalledWith("bridge-turn-final", 4);
   });
 
-  it("delivers long app-server delta text before the turn completes", async () => {
+  it("buffers app-server delta text and delivers one complete reply", async () => {
     const message = createMessage();
     const turnStore = createTurnStore();
     vi.mocked(turnStore.getTurnByCodexTurn).mockResolvedValue({
@@ -2161,6 +2366,7 @@ describe("BridgeOrchestrator", () => {
         replyToMessageId: message.messageId
       }
     });
+    expect(delivered).toEqual([]);
     await orchestrator.handleTurnEvent({
       sessionKey: message.sessionKey,
       turnId: "codex-turn-stream",
@@ -2174,7 +2380,7 @@ describe("BridgeOrchestrator", () => {
       }
     });
 
-    expect(delivered.map((draft) => draft.text)).toEqual([firstChunk, " done"]);
+    expect(delivered.map((draft) => draft.text)).toEqual([`${firstChunk} done`]);
   });
 
   it("does not persist non-terminal failed tool summaries as turn errors", async () => {
@@ -2358,6 +2564,186 @@ describe("BridgeOrchestrator", () => {
       expect.objectContaining({
         onDraft: expect.any(Function)
       })
+    );
+  });
+
+  it("lets completed events own delivery after an event-backed turn starts", async () => {
+    const message = createMessage();
+    const transcriptStore: TranscriptStorePort = {
+      hasInbound: vi.fn().mockResolvedValue(false),
+      recordInbound: vi.fn(),
+      recordOutbound: vi.fn(),
+      listRecentConversation: vi.fn().mockResolvedValue([])
+    };
+    const sessionStore: SessionStorePort = {
+      getSession: vi.fn().mockResolvedValue(createSession(message)),
+      createSession: vi.fn(),
+      updateSessionStatus: vi.fn(),
+      updateBinding: vi.fn(),
+      updateLastCodexTurnId: vi.fn(),
+      updateSkillContextKey: vi.fn(),
+      updateConversationProvider: vi.fn(),
+      withSessionLock: vi.fn(async (_sessionKey, work) => work())
+    };
+
+    let orchestrator!: BridgeOrchestrator;
+    const conversationProvider: ConversationProviderPort = {
+      runTurn: vi.fn(async (_message, options) => {
+        await orchestrator.handleTurnEvent({
+          sessionKey: message.sessionKey,
+          turnId: "turn-event-backed",
+          sequence: 1,
+          eventType: TurnEventType.Delta,
+          createdAt: "2026-07-19T10:00:01.000Z",
+          isFinal: false,
+          payload: {
+            text: "partial reply",
+            replyToMessageId: message.messageId
+          }
+        });
+        await options?.onDraft?.({
+          draftId: "draft-event-backed-partial",
+          turnId: "turn-event-backed",
+          sessionKey: message.sessionKey,
+          text: "partial reply",
+          createdAt: "2026-07-19T10:00:02.000Z"
+        });
+        await orchestrator.handleTurnEvent({
+          sessionKey: message.sessionKey,
+          turnId: "turn-event-backed",
+          sequence: 2,
+          eventType: TurnEventType.Completed,
+          createdAt: "2026-07-19T10:00:03.000Z",
+          isFinal: true,
+          payload: {
+            fullText: "complete reply",
+            replyToMessageId: message.messageId,
+            completionReason: "stable"
+          }
+        });
+        return [];
+      })
+    };
+    const qqEgress: QqEgressPort = {
+      deliver: vi.fn(async (draft: OutboundDraft) => ({
+        jobId: `job-${draft.draftId}`,
+        sessionKey: draft.sessionKey,
+        providerMessageId: null,
+        deliveredAt: draft.createdAt
+      }))
+    };
+
+    orchestrator = new BridgeOrchestrator({
+      transcriptStore,
+      sessionStore,
+      conversationProvider,
+      qqEgress
+    });
+
+    await orchestrator.handleInbound(message);
+
+    expect(qqEgress.deliver).toHaveBeenCalledTimes(1);
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: "turn-event-backed",
+        text: "complete reply"
+      })
+    );
+    expect(transcriptStore.recordOutbound).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let a retired compacted turn reclaim the same inbound message", async () => {
+    const message = createMessage();
+    const transcriptStore: TranscriptStorePort = {
+      hasInbound: vi.fn().mockResolvedValue(false),
+      recordInbound: vi.fn(),
+      recordOutbound: vi.fn(),
+      listRecentConversation: vi.fn().mockResolvedValue([])
+    };
+    const sessionStore: SessionStorePort = {
+      getSession: vi.fn().mockResolvedValue(createSession(message)),
+      createSession: vi.fn(),
+      updateSessionStatus: vi.fn(),
+      updateBinding: vi.fn(),
+      updateLastCodexTurnId: vi.fn(),
+      updateSkillContextKey: vi.fn(),
+      updateConversationProvider: vi.fn(),
+      withSessionLock: vi.fn(async (_sessionKey, work) => work())
+    };
+
+    let orchestrator!: BridgeOrchestrator;
+    const conversationProvider: ConversationProviderPort = {
+      runTurn: vi.fn(async () => {
+        await orchestrator.handleTurnEvent({
+          sessionKey: message.sessionKey,
+          turnId: "turn-before-compact",
+          sequence: 1,
+          eventType: TurnEventType.Completed,
+          createdAt: "2026-07-19T10:10:01.000Z",
+          isFinal: true,
+          payload: {
+            status: "failed",
+            replyToMessageId: message.messageId
+          }
+        });
+        await orchestrator.handleTurnEvent({
+          sessionKey: message.sessionKey,
+          turnId: "turn-after-compact",
+          sequence: 1,
+          eventType: TurnEventType.Completed,
+          createdAt: "2026-07-19T10:10:02.000Z",
+          isFinal: true,
+          payload: {
+            fullText: "reply after compact",
+            replyToMessageId: message.messageId,
+            completionReason: "stable"
+          }
+        });
+        await orchestrator.handleTurnEvent({
+          sessionKey: message.sessionKey,
+          turnId: "turn-before-compact",
+          sequence: 2,
+          eventType: TurnEventType.Completed,
+          createdAt: "2026-07-19T10:10:03.000Z",
+          isFinal: true,
+          payload: {
+            fullText: "late reply from retired turn",
+            replyToMessageId: message.messageId,
+            completionReason: "stable"
+          }
+        });
+        return [];
+      })
+    };
+    const qqEgress: QqEgressPort = {
+      deliver: vi.fn(async (draft: OutboundDraft) => ({
+        jobId: `job-${draft.draftId}`,
+        sessionKey: draft.sessionKey,
+        providerMessageId: null,
+        deliveredAt: draft.createdAt
+      }))
+    };
+
+    orchestrator = new BridgeOrchestrator({
+      transcriptStore,
+      sessionStore,
+      conversationProvider,
+      qqEgress
+    });
+
+    await orchestrator.handleInbound(message);
+
+    expect(qqEgress.deliver).toHaveBeenCalledTimes(1);
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: "turn-after-compact",
+        text: "reply after compact"
+      })
+    );
+    expect(sessionStore.updateLastCodexTurnId).toHaveBeenCalledTimes(2);
+    expect(sessionStore.updateLastCodexTurnId).toHaveBeenLastCalledWith(
+      message.sessionKey,
+      "turn-after-compact"
     );
   });
 
@@ -2584,6 +2970,86 @@ describe("BridgeOrchestrator", () => {
     expect(transcriptStore.recordOutbound).toHaveBeenCalledTimes(1);
   });
 
+  it("deduplicates a formatted completed reply when the provider returns the same media draft", async () => {
+    const message = createMessage();
+    const rawText = "图片如下：\n<qqmedia>/tmp/final-image.png</qqmedia>";
+    const transcriptStore: TranscriptStorePort = {
+      hasInbound: vi.fn().mockResolvedValue(false),
+      recordInbound: vi.fn(),
+      recordOutbound: vi.fn(),
+      listRecentConversation: vi.fn().mockResolvedValue([])
+    };
+    const sessionStore: SessionStorePort = {
+      getSession: vi.fn().mockResolvedValue(createSession(message)),
+      createSession: vi.fn(),
+      updateSessionStatus: vi.fn(),
+      updateBinding: vi.fn(),
+      updateLastCodexTurnId: vi.fn(),
+      updateSkillContextKey: vi.fn(),
+      updateConversationProvider: vi.fn(),
+      withSessionLock: vi.fn(async (_sessionKey, work) => work())
+    };
+
+    let orchestrator!: BridgeOrchestrator;
+    const conversationProvider: ConversationProviderPort = {
+      runTurn: vi.fn(async () => {
+        await orchestrator.handleTurnEvent({
+          sessionKey: message.sessionKey,
+          turnId: "turn-formatted-media",
+          sequence: 1,
+          eventType: TurnEventType.Completed,
+          createdAt: "2026-07-19T10:20:01.000Z",
+          isFinal: true,
+          payload: {
+            fullText: rawText,
+            mediaReferences: ["/tmp/final-image.png"],
+            replyToMessageId: message.messageId,
+            completionReason: "stable"
+          }
+        });
+        return [{
+          draftId: "draft-formatted-media-final",
+          turnId: "turn-formatted-media",
+          sessionKey: message.sessionKey,
+          text: rawText,
+          createdAt: "2026-07-19T10:20:02.000Z"
+        }];
+      })
+    };
+    const qqEgress: QqEgressPort = {
+      deliver: vi.fn(async (draft: OutboundDraft) => ({
+        jobId: `job-${draft.draftId}`,
+        sessionKey: draft.sessionKey,
+        providerMessageId: null,
+        deliveredAt: draft.createdAt
+      }))
+    };
+
+    orchestrator = new BridgeOrchestrator({
+      transcriptStore,
+      sessionStore,
+      conversationProvider,
+      qqEgress,
+      draftFormatter: (draft) => formatWeixinOutboundDraft(enrichQqOutboundDraft(draft))
+    });
+
+    await orchestrator.handleInbound(message);
+
+    expect(qqEgress.deliver).toHaveBeenCalledTimes(1);
+    expect(qqEgress.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: "turn-formatted-media",
+        text: "图片如下：",
+        mediaArtifacts: [
+          expect.objectContaining({
+            localPath: "/tmp/final-image.png"
+          })
+        ]
+      })
+    );
+    expect(transcriptStore.recordOutbound).toHaveBeenCalledTimes(1);
+  });
+
   it("marks completed tail flush delivery failures before propagating them", async () => {
     const message = createMessage();
     const firstDraft: OutboundDraft = {
@@ -2749,8 +3215,30 @@ describe("BridgeOrchestrator", () => {
     );
   });
 
-  it("does not resend media artifacts on completed turn events after a media-only draft already delivered them", async () => {
+  it("delivers completed media once when the provider final draft arrives after completion", async () => {
     const message = createMessage();
+    const turnStore = createTurnStore();
+    let turnStatus = BridgeTurnStatus.Running;
+    const readTurn = () => ({
+      turnId: "bridge-turn-media",
+      sessionKey: message.sessionKey,
+      codexThreadRef: "thread-1",
+      codexTurnRef: "turn-3",
+      qqMessageId: message.messageId,
+      status: turnStatus,
+      startedAt: "2026-04-12T12:20:00.000Z",
+      updatedAt: "2026-04-12T12:20:03.000Z",
+      deadlineAt: null,
+      lastEventAt: null,
+      lastToolName: null,
+      lastError: null,
+      deliveredTextLength: 0
+    });
+    vi.mocked(turnStore.getTurn).mockImplementation(async () => readTurn());
+    vi.mocked(turnStore.getTurnByCodexTurn).mockImplementation(async () => readTurn());
+    vi.mocked(turnStore.recordTurnEvent).mockImplementation(async (event) => {
+      turnStatus = event.status;
+    });
     const mediaDraft: OutboundDraft = {
       draftId: "draft-media-1",
       turnId: "turn-3",
@@ -2790,7 +3278,6 @@ describe("BridgeOrchestrator", () => {
     let orchestrator!: BridgeOrchestrator;
     const conversationProvider: ConversationProviderPort = {
       runTurn: vi.fn(async (_message, options) => {
-        await options?.onDraft?.(mediaDraft);
         await orchestrator.handleTurnEvent({
           sessionKey: message.sessionKey,
           turnId: "turn-3",
@@ -2799,11 +3286,13 @@ describe("BridgeOrchestrator", () => {
           createdAt: "2026-04-12T12:20:03.000Z",
           isFinal: true,
           payload: {
-            fullText: "<qqmedia>/tmp/demo.jpg</qqmedia>",
+            fullText: "",
+            mediaReferences: ["/tmp/demo.jpg"],
             replyToMessageId: message.messageId,
             completionReason: "stable"
           }
         });
+        await options?.onDraft?.(mediaDraft);
         return [];
       })
     };
@@ -2820,9 +3309,9 @@ describe("BridgeOrchestrator", () => {
     orchestrator = new BridgeOrchestrator({
       transcriptStore,
       sessionStore,
+      turnStore,
       conversationProvider,
-      qqEgress,
-      draftFormatter: (draft) => formatWeixinOutboundDraft(enrichQqOutboundDraft(draft))
+      qqEgress
     });
 
     await orchestrator.handleInbound(message);

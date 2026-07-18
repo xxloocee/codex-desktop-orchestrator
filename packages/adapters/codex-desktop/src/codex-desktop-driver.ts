@@ -592,7 +592,6 @@ export class CodexDesktopDriver implements DesktopDriverPort {
               );
               emittedReplyText = this.mergeObservedReply(emittedReplyText, candidateReply.reply ?? "");
               this.mergeObservedMediaReferences(emittedMediaReferences, candidateReply.mediaReferences);
-              await options.onDraft(finalDeltaDraft);
             }
             await emitTurnEvent(
               TurnEventType.Completed,
@@ -601,6 +600,9 @@ export class CodexDesktopDriver implements DesktopDriverPort {
                 completionReason: "stable"
               },
               true
+            );
+            await options.onDraft(
+              this.buildOutboundDraftFromSnapshot(binding.sessionKey, candidateReply, turnId)
             );
             return [];
           }
@@ -645,7 +647,6 @@ export class CodexDesktopDriver implements DesktopDriverPort {
             );
             emittedReplyText = this.mergeObservedReply(emittedReplyText, candidateReply.reply ?? "");
             this.mergeObservedMediaReferences(emittedMediaReferences, candidateReply.mediaReferences);
-            await options.onDraft(deltaDraft);
             stablePolls = 0;
           }
         }
@@ -678,7 +679,6 @@ export class CodexDesktopDriver implements DesktopDriverPort {
             },
             false
           );
-          await options.onDraft(timeoutDraft);
         }
         await emitTurnEvent(
           TurnEventType.Completed,
@@ -688,6 +688,9 @@ export class CodexDesktopDriver implements DesktopDriverPort {
             completionReason: "timeout_flush"
           },
           true
+        );
+        await options.onDraft(
+          this.buildOutboundDraftFromSnapshot(binding.sessionKey, latestNewReply, turnId)
         );
         return [];
       }
@@ -861,7 +864,6 @@ export class CodexDesktopDriver implements DesktopDriverPort {
     if (options.onDraft) {
       let assembledText = "";
       for (const commentary of localReply.commentaryMessages) {
-        const draft = this.buildOutboundDraftFromText(binding.sessionKey, commentary, [], turnId);
         assembledText = assembledText ? `${assembledText}\n${commentary}` : commentary;
         await emitTurnEvent(
           TurnEventType.Delta,
@@ -872,7 +874,6 @@ export class CodexDesktopDriver implements DesktopDriverPort {
           },
           false
         );
-        await options.onDraft(draft);
       }
 
       await emitTurnEvent(
@@ -883,6 +884,14 @@ export class CodexDesktopDriver implements DesktopDriverPort {
           completionReason: "stable"
         },
         true
+      );
+      await options.onDraft(
+        this.buildOutboundDraftFromText(
+          binding.sessionKey,
+          localReply.fullText,
+          localReply.mediaReferences,
+          turnId
+        )
       );
       return [];
     }
